@@ -1,0 +1,19 @@
+# Downloaded pins and rendered output - regenerable cache, not source
+images/
+wallpapers/
+
+# Runtime state and logs
+.state.json
+agent.log
+agent.err
+*.tmp
+
+# Machine-specific - see the .example files
+config.json
+com.pinterest.wallpaper.plist
+
+# macOS and local tooling
+.DS_Store
+__pycache__/
+.omo/
+.codegraph

@@ -1,0 +1,13 @@
+{
+  "boards": [
+    "https://www.pinterest.com/YOUR_USERNAME/YOUR_BOARD/"
+  ],
+  "refresh_hours": 24,
+  "retry_hours": 1,
+  "resolution": "auto",
+  "fit_mode": "cover",
+  "sharpen": true,
+  "menubar_gradient": false,
+  "notifications": true,
+  "new_pins_first": true
+}
