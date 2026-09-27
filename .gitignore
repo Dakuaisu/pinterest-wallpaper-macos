@@ -1,19 +1,23 @@
 # Downloaded pins and rendered output - regenerable cache, not source
 images/
+upscaled/
 wallpapers/
 
-# Runtime state and logs
+# Runtime state, locks and logs
 .state.json
+.state.json.corrupt-*
+*.lock
 agent.log
 agent.err
 *.tmp
 
-# Machine-specific - see the .example files
+# Machine-specific - see config.example.json
 config.json
-com.pinterest.wallpaper.plist
+.venv/
 
 # macOS and local tooling
 .DS_Store
 __pycache__/
 .omo/
 .codegraph
+.serena/

@@ -2,12 +2,29 @@
   "boards": [
     "https://www.pinterest.com/YOUR_USERNAME/YOUR_BOARD/"
   ],
+  "interval_minutes": 15,
   "refresh_hours": 24,
   "retry_hours": 1,
+  "max_pins": 250,
+  "skip_video": true,
+  "skip_upscale_over": 0,
   "resolution": "auto",
   "fit_mode": "cover",
+  "crop": "smart",
+  "max_upscale": 0,
+  "backdrop": "blur",
   "sharpen": true,
   "menubar_gradient": false,
+  "upscaler": "",
+  "upscaler_model": "realesrgan-x4plus",
+  "different_per_display": false,
+  "favorite_weight": 2,
+  "mood": "off",
+  "night_hours": [
+    19,
+    7
+  ],
+  "skip_when_locked": true,
   "notifications": true,
   "new_pins_first": true
 }

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Convenience wrapper: ./pw next, ./pw status, ./pw ban ...
+# Convenience wrapper: ./pw next, ./pw status, ./pw rotate ...
 
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+
+if [[ -x .venv/bin/python3 ]]; then
+    exec .venv/bin/python3 pinterest_wallpaper.py "$@"
+fi
 
 exec /usr/bin/python3 pinterest_wallpaper.py "$@"
