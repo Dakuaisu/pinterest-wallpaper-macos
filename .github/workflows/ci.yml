@@ -40,4 +40,4 @@ jobs:
           python -m pip install ruff==0.16.10
           ruff check --output-format=github .
       - name: ShellCheck
-        run: shellcheck extras/*/*.sh
+        run: shellcheck extras/*/*.sh scripts/*.sh
