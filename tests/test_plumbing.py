@@ -157,10 +157,9 @@ class StateFileTests(Sandbox):
 
     def test_locked_state_saves_even_when_the_command_fails(self):
 
-        with self.assertRaises(RuntimeError):
-            with pw.locked_state() as state:
-                state["banned"].append("7")
-                raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError), pw.locked_state() as state:
+            state["banned"].append("7")
+            raise RuntimeError("boom")
 
         self.assertEqual(pw.load_state()["banned"], ["7"])
 

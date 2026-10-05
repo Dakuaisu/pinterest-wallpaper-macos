@@ -15,7 +15,7 @@ from PIL import Image
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import pinterest_wallpaper as pw  # noqa: E402
+import pinterest_wallpaper as pw
 
 BOARD = "https://www.pinterest.com/someone/cats/"
 SCREEN = {"id": 1, "name": "Built-in", "width": 160, "height": 100}

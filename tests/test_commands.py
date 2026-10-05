@@ -236,7 +236,7 @@ class StatusTests(Sandbox):
     def test_status_before_the_first_sync(self):
 
         with self.agent({}):
-            code, out = self.printed(pw.cmd_status)
+            _, out = self.printed(pw.cmd_status)
 
         self.assertIn("(not synced yet)", out)
         self.assertIn("Showing       : -", out)

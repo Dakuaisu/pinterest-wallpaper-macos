@@ -1,4 +1,3 @@
-import json
 import os
 import unittest
 from unittest import mock
@@ -6,8 +5,18 @@ from unittest import mock
 import requests
 
 from helpers import (
-    BOARD, SCREEN, FakeResponse, Sandbox, board_page, feed_pin, image_bytes, image_session,
-    make_listing, make_pin, pw, rss_item,
+    BOARD,
+    SCREEN,
+    FakeResponse,
+    Sandbox,
+    board_page,
+    feed_pin,
+    image_bytes,
+    image_session,
+    make_listing,
+    make_pin,
+    pw,
+    rss_item,
 )
 
 
@@ -147,9 +156,10 @@ class BoardTests(Sandbox):
 
     def test_rss_without_pins_is_an_error(self):
 
-        with mock.patch.object(pw.SESSION, "get", return_value=FakeResponse("<rss><channel><title>x</title></channel></rss>")):
-            with self.assertRaisesRegex(RuntimeError, "no pins"):
-                pw.scrape_board_rss(BOARD, 250)
+        empty = FakeResponse("<rss><channel><title>x</title></channel></rss>")
+
+        with mock.patch.object(pw.SESSION, "get", return_value=empty), self.assertRaisesRegex(RuntimeError, "no pins"):
+            pw.scrape_board_rss(BOARD, 250)
 
     def test_rss_pins_match_the_page_pin_shape(self):
 
@@ -203,8 +213,7 @@ class DownloadTests(Sandbox):
             (image_session(image_bytes((100, 100))), "too small"),
         ):
             with self.subTest(message=message), mock.patch.object(pw, "worker_session", return_value=session):
-                with self.assertRaisesRegex(ValueError, message):
-                    pw.download_source(make_pin("1"))
+                self.assertRaisesRegex(ValueError, message, pw.download_source, make_pin("1"))
 
     def test_png_is_stored_with_its_own_extension(self):
 
@@ -217,9 +226,8 @@ class DownloadTests(Sandbox):
 
         refused = mock.Mock(get=lambda url, **kwargs: FakeResponse(status=403))
 
-        with mock.patch.object(pw, "worker_session", return_value=refused):
-            with self.assertRaises(requests.HTTPError):
-                pw.download_source(dict(make_pin("1"), fallbacks=["https://i.pinimg.com/736x/1.jpg"]))
+        with mock.patch.object(pw, "worker_session", return_value=refused), self.assertRaises(requests.HTTPError):
+            pw.download_source(dict(make_pin("1"), fallbacks=["https://i.pinimg.com/736x/1.jpg"]))
 
     def test_try_download_returns_the_error(self):
 

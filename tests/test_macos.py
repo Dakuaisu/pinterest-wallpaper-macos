@@ -24,13 +24,13 @@ class OsascriptTests(Sandbox):
 
     def test_failure_raises_with_stderr_or_exit_status(self):
 
-        with mock.patch.object(pw.subprocess, "run", return_value=completed(returncode=1, stderr="nope")):
-            with self.assertRaisesRegex(RuntimeError, "nope"):
-                pw.osascript([])
+        stderr, crashed = completed(returncode=1, stderr="nope"), completed(returncode=139)
 
-        with mock.patch.object(pw.subprocess, "run", return_value=completed(returncode=139)):
-            with self.assertRaisesRegex(RuntimeError, "status 139"):
-                pw.osascript([])
+        with mock.patch.object(pw.subprocess, "run", return_value=stderr), self.assertRaisesRegex(RuntimeError, "nope"):
+            pw.osascript([])
+
+        with mock.patch.object(pw.subprocess, "run", return_value=crashed), self.assertRaisesRegex(RuntimeError, "status 139"):
+            pw.osascript([])
 
 
 class ScreenTests(Sandbox):

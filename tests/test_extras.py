@@ -11,7 +11,7 @@ FAKE_PW = '#!/bin/bash\necho "pw:$*"\n'
 
 def run(path, *args, cwd="/"):
 
-    result = subprocess.run([path, *args], capture_output=True, text=True, cwd=cwd, timeout=30)
+    result = subprocess.run([path, *args], capture_output=True, text=True, cwd=cwd, timeout=30, check=False)
 
     return result.returncode, result.stdout.strip()
 

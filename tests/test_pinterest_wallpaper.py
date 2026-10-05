@@ -12,7 +12,16 @@ import requests
 from PIL import Image
 
 from helpers import (
-    BOARD, REAL, SCREEN, FakeResponse, Sandbox, board_page, feed_pin, image_bytes, make_listing, pw,
+    BOARD,
+    REAL,
+    SCREEN,
+    FakeResponse,
+    Sandbox,
+    board_page,
+    feed_pin,
+    image_bytes,
+    make_listing,
+    pw,
 )
 
 
@@ -185,9 +194,10 @@ class ScrapeTests(Sandbox):
 
     def test_network_error_is_offline_and_skips_rss(self):
 
-        with mock.patch.object(pw.SESSION, "get", side_effect=requests.ConnectionError("dns")) as get:
-            with self.assertRaises(pw.Offline):
-                pw.fetch_board(BOARD, 250)
+        offline = requests.ConnectionError("dns")
+
+        with mock.patch.object(pw.SESSION, "get", side_effect=offline) as get, self.assertRaises(pw.Offline):
+            pw.fetch_board(BOARD, 250)
 
         self.assertEqual(get.call_count, 1)
 
@@ -558,9 +568,8 @@ class RenderTests(Sandbox):
 
         truncated = mock.Mock(get=lambda url, **kw: FakeResponse(content=body[:200], content_type="image/jpeg"))
 
-        with mock.patch.object(pw, "worker_session", return_value=truncated):
-            with self.assertRaises(Exception):
-                pw.download_source({"key": "6", "url": "https://x/6.jpg"})
+        with mock.patch.object(pw, "worker_session", return_value=truncated), self.assertRaises(OSError):
+            pw.download_source({"key": "6", "url": "https://x/6.jpg"})
 
         self.assertNotIn("6", pw.source_files())
 
@@ -805,9 +814,8 @@ class ReviewFixTests(Sandbox):
 
     def test_setter_refuses_missing_files_before_calling_osascript(self):
 
-        with mock.patch.object(pw, "osascript") as osascript:
-            with self.assertRaises(RuntimeError):
-                REAL["set_wallpapers"]([({"id": 1}, "/nonexistent/x.jpg")])
+        with mock.patch.object(pw, "osascript") as osascript, self.assertRaises(RuntimeError):
+            REAL["set_wallpapers"]([({"id": 1}, "/nonexistent/x.jpg")])
 
         osascript.assert_not_called()
 

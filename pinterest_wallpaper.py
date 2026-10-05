@@ -27,9 +27,8 @@ warnings.filterwarnings(
 )
 
 import requests
-from requests.adapters import HTTPAdapter, Retry
 from PIL import Image, ImageFilter, ImageOps, ImageStat
-
+from requests.adapters import HTTPAdapter, Retry
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_DIR = os.path.join(BASE_DIR, "images")
@@ -415,7 +414,7 @@ def load_state():
         with open(STATE_FILE) as handle:
             loaded = json.load(handle)
         if not isinstance(loaded, dict):
-            raise ValueError("not a JSON object")
+            raise ValueError("not a JSON object")  # noqa: TRY004 - caught below with the other corrupt-state errors
 
     except FileNotFoundError:
         return state
@@ -555,6 +554,7 @@ def osascript(args, timeout=30):
 
     result = subprocess.run(
         ["osascript", *args],
+        check=False,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -625,6 +625,7 @@ def screen_locked():
     try:
         raw = subprocess.run(
             ["ioreg", "-n", "Root", "-d1", "-a"],
+            check=False,
             capture_output=True,
             timeout=10,
         ).stdout
@@ -645,6 +646,7 @@ def dark_mode():
 
     result = subprocess.run(
         ["defaults", "read", "-g", "AppleInterfaceStyle"],
+        check=False,
         capture_output=True,
         text=True,
         timeout=10,
@@ -675,6 +677,7 @@ def launchctl_interval(label):
 
     result = subprocess.run(
         ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -970,7 +973,7 @@ def image_meta(img):
         "width": img.width,
         "height": img.height,
         "luma": round(ImageStat.Stat(small.convert("L")).mean[0], 1),
-        "avg": "#%02x%02x%02x" % avg[:3],
+        "avg": "#{:02x}{:02x}{:02x}".format(*avg[:3]),
     }
 
 
@@ -1051,6 +1054,7 @@ def run_upscaler(binary, model, src, out):
 
         result = subprocess.run(
             [binary, "-i", png_in, "-o", png_out, "-n", model, "-s", "4"],
+            check=False,
             cwd=os.path.dirname(os.path.abspath(binary)),
             capture_output=True,
             text=True,
@@ -1099,9 +1103,10 @@ def upscale_sources(config, state, files, limit):
             run_upscaler(binary, config["upscaler_model"], os.path.join(IMAGE_DIR, files[key]), out)
             log(f"Upscaled pin {key} with {config['upscaler_model']}.")
         except Exception as e:
+            reason = short(e)
             # Remembered, so one image the upscaler can't handle doesn't cost every tick a timeout.
-            atomic_write(failed, lambda handle: handle.write(short(e).encode()))
-            log_error(f"Upscaling pin {key} failed ({short(e)}); delete upscaled/ to retry.")
+            atomic_write(failed, lambda handle, reason=reason: handle.write(reason.encode()))
+            log_error(f"Upscaling pin {key} failed ({reason}); delete upscaled/ to retry.")
 
 
 # =========================
@@ -1182,7 +1187,7 @@ def make_backdrop(img, size, style, color):
     if style == "color":
 
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", color or ""):
-            color = "#%02x%02x%02x" % img.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))[:3]
+            color = "#{:02x}{:02x}{:02x}".format(*img.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))[:3])
 
         return Image.new("RGB", size, color)
 
@@ -1641,7 +1646,7 @@ def build_deck(pool, favorites, weight, avoid=()):
 
     for i, key in enumerate(deck):
         if key not in avoid:
-            deck[0], deck[i] = deck[i], deck[0]
+            deck[0], deck[i] = key, deck[0]
             break
 
     return deck
@@ -2093,7 +2098,7 @@ def pause_label(state):
 def agent_summary(config):
 
     interval = launchctl_interval(LABEL)
-    wanted = int(round(config["interval_minutes"] * 60))
+    wanted = round(config["interval_minutes"] * 60)
 
     if launchctl_interval(LEGACY_LABEL) is not None:
         return "old com.pinterest.wallpaper agent is running; run ./pw install to migrate"
@@ -2292,7 +2297,7 @@ def bootout(label):
     if launchctl_interval(label) is None:
         return False
 
-    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, check=False)
 
     for _ in range(20):
         if launchctl_interval(label) is None:
@@ -2315,7 +2320,7 @@ def cmd_install(config, args):
     agent = {
         "Label": LABEL,
         "ProgramArguments": [PW, "tick"],
-        "StartInterval": int(round(config["interval_minutes"] * 60)),
+        "StartInterval": round(config["interval_minutes"] * 60),
         "RunAtLoad": True,
         "StandardOutPath": os.path.join(BASE_DIR, "agent.log"),
         "StandardErrorPath": os.path.join(BASE_DIR, "agent.err"),
@@ -2330,6 +2335,7 @@ def cmd_install(config, args):
 
         result = subprocess.run(
             ["launchctl", "bootstrap", f"gui/{os.getuid()}", plist_path()],
+            check=False,
             capture_output=True,
             text=True,
         )
