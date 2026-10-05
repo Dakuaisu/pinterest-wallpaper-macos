@@ -1,10 +1,17 @@
 # pinterest-wallpaper-macos
 
+[![CI](https://github.com/Dakuaisu/pinterest-wallpaper-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/Dakuaisu/pinterest-wallpaper-macos/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+![The wallpaper changing, the SwiftBar menu, and a Raycast command](docs/demo.gif)
+
 Rotates your macOS desktop wallpaper through the pins on one or more public Pinterest boards.
 
 A `launchd` agent changes the wallpaper on a timer (every 15 minutes by default) and re-reads the boards once a day, so new pins join the rotation and unpinned ones leave it. Each wallpaper is rendered at the native resolution of each display rather than letting macOS upscale it.
 
 No Pinterest API key or login required — it reads the public board page.
+
+**Why:** you already collect the images you love on Pinterest; this puts them on your desktop at full resolution, without maintaining a wallpaper folder by hand.
 
 ## Requirements
 
@@ -36,7 +43,7 @@ cp config.example.json config.json
 /usr/bin/python3 -m pip install --user -r requirements.txt
 ```
 
-`./pw install` writes `~/Library/LaunchAgents/io.github.dakuaisu.pinterest-wallpaper.plist` and loads it. Run it again after changing `interval_minutes`. It also removes the agent older versions installed (`com.pinterest.wallpaper`). `./pw uninstall` removes it.
+`./pw install` writes `~/Library/LaunchAgents/io.github.dakuaisu.pinterest-wallpaper.plist` and loads it. Run it again after changing `interval_minutes`. It also removes the agent from older versions (`com.pinterest.wallpaper`). `./pw uninstall` removes it.
 
 ## Commands
 
@@ -87,7 +94,7 @@ A manual `next`/`prev` isn't overridden by the agent straight away: the next sch
 | `backdrop` | `"blur"` | Background behind fitted images: `"blur"` (blurred copy) or `"color"` (the pin's main colour). |
 | `sharpen` | `true` | Unsharp mask when an image is enlarged. Subtle. |
 | `menubar_gradient` | `false` | Dark gradient along the top edge so menu-bar text stays readable. |
-| `upscaler` | `""` | Path to [`realesrgan-ncnn-vulkan`](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) to AI-upscale pins that need more than 1.5× enlargement. Two pins per tick, after the wallpaper has changed, so it never delays rotation. Its `models/` folder must sit next to the binary. A pin it fails on is skipped from then on; delete `upscaled/` to retry. |
+| `upscaler` | `""` | Path to [`realesrgan-ncnn-vulkan`](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) to AI-upscale pins needing more than 1.5× enlargement. Runs on two pins per tick, after the wallpaper changes, so it never delays rotation. Keep its `models/` folder next to the binary. Pins it fails on are skipped; delete `upscaled/` to retry. |
 | `upscaler_model` | `"realesrgan-x4plus"` | Model passed to the upscaler with `-n`. |
 | `different_per_display` | `false` | Show a different pin on each display instead of the same one everywhere. |
 | `favorite_weight` | `2` | How many times a favorite appears per pass through the deck (spread out, never back to back). |
@@ -116,7 +123,7 @@ If you use several Spaces, macOS only changes the wallpaper of the Space that's 
 
 ## How it works
 
-Pinterest builds board pages in the browser, so the HTML has no plain list of images. It does embed the page's Redux state in a `__PWS_INITIAL_PROPS__` script tag, and the `BoardFeedResource` entry inside it lists the first page of pins on the board — no ads, no suggestions — plus a bookmark for the next page, which is fetched from Pinterest's `BoardFeedResource/get` endpoint until `max_pins`. The originals are downloaded to `images/` as-is (named by pin ID) and rendered into `wallpapers/` on demand, one file per pin, display size and render settings.
+Pinterest builds board pages in the browser, so the HTML has no plain list of images. It does embed the page's Redux state in a `__PWS_INITIAL_PROPS__` script tag; its `BoardFeedResource` entry lists the board's first page of pins (no ads, no suggestions) and a bookmark for the next page, fetched from Pinterest's `BoardFeedResource/get` endpoint until `max_pins`. Originals are downloaded to `images/` unchanged (named by pin ID) and rendered into `wallpapers/` on demand, one file per pin, display size and render settings.
 
 Rotation uses a shuffle bag: every pin is shown once, in random order, before any repeats (favorites a few times, spread out).
 
@@ -143,3 +150,7 @@ State lives in `.state.json` (a corrupt one is moved aside, not silently reset).
 ```sh
 python3 -m unittest discover -s tests
 ```
+
+## License
+
+[MIT](LICENSE)
