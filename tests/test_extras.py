@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -93,8 +94,8 @@ class ExtrasTests(unittest.TestCase):
 
         script = os.path.join(ROOT, "pinterest_wallpaper.py")
 
-        self.assertEqual(run("/usr/bin/python3", script, "--help")[0], 0)
-        self.assertEqual(run("/usr/bin/python3", script, "no-such-command")[0], 2)
+        self.assertEqual(run(sys.executable, script, "--help")[0], 0)
+        self.assertEqual(run(sys.executable, script, "no-such-command")[0], 2)
 
     def test_pw_wrapper_prefers_the_venv_and_runs_from_its_own_folder(self):
 
