@@ -53,12 +53,15 @@ cp config.example.json config.json
 ./pw shuffle                   reshuffle the deck and jump to a new wallpaper
 ./pw pause [30m|2h|1d]         stop automatic changes (until ./pw resume without a duration)
 ./pw resume                    restart automatic changes
+./pw tui                       open the Pinwall control center
 
 ./pw ban [display]             drop the pin on screen from rotation, then advance
 ./pw fav [display]             toggle favorite; favorites come up more often
-./pw rotate [cw|ccw|180|reset] [display]
-                               turn the pin on screen, e.g. so a vertical pin fills a landscape display
+./pw rotate [cw|ccw|180|reset|auto] [display]
+                                turn the pin on screen, e.g. so a vertical pin fills a landscape display
 ./pw open [display]            open the pin on screen on pinterest.com
+./pw orient preview [PIN_ID]   print a prediction without caching it
+./pw orient scan               cache predictions for up to four pins
 
 ./pw refresh                   re-read the boards from Pinterest now
 ./pw bans                      list banned pins
@@ -73,6 +76,56 @@ cp config.example.json config.json
 Bans, favorites and rotations are stored per pin, so they survive re-renders, display changes and Pinterest URL changes. A rotation is remembered for that pin every time it comes up.
 
 A manual `next`/`prev` isn't overridden by the agent straight away: the next scheduled change is skipped if you changed the wallpaper within the last half interval. Scheduled changes are also skipped while the screen is locked (`skip_when_locked`), so you don't miss wallpapers nobody saw.
+
+## Pinwall control center
+
+Run `pinwall` with no arguments, or `./pw tui` from the project directory. It needs an interactive terminal of at least 36 columns by 10 rows and no extra dependencies.
+
+Everything happens on one screen: your wallpapers on the left, a live preview of the selected one on the right, and the keys you can press along the bottom. Moving through the list never changes your desktop.
+
+| Key | What it does |
+| --- | --- |
+| `↑` `↓` (or `k` `j`), `PgUp` `PgDn`, `Home` `End` | Move through the list |
+| `Enter` | Put the selected wallpaper on your desktop |
+| `Space` | Add it to or remove it from favorites |
+| `r` | Rotate a quarter turn; the preview updates straight away |
+| `f` | Open the live framing editor; `m` switches proportional and stretch modes |
+| `F` | Toggle the legacy fill setting and clear any custom framing for this pin |
+| `c` | Edit crop focus on the whole photo; arrow keys move it, `0` resets it, `Enter` keeps the draft, and `Esc` cancels this edit |
+| `]` | Cycle the display used for the preview (also works in the focus and framing editors) |
+| `v` | Compare with the untouched original |
+| `x` | Ban it (asks first) |
+| `/`, `*` | Search by size as you type (try `1920`), show favorites only. `Esc` clears them |
+| `n` `p` `S` `P` `R` | Next, previous, shuffle, pause or resume, refresh boards |
+| `+` | Add a board: paste its Pinterest link, and its pins are fetched straight away |
+| `b` | Boards: `Enter` shows only that board, `d` switches it off or back on, `x` removes it (asks first), `+` adds one |
+| `a` | More actions: pause for a while, banned wallpapers, ban or open what's on screen, setup |
+| `,` / `i` / `?` | Settings / status / keyboard help |
+| `q` | Quit (or leave the view you're in) |
+
+In the list, `★` marks a favorite, `●` the wallpaper on screen now, and `~` an adjustment you haven't saved. Each row shows the pin's size and its dominant colour, since pins have no titles.
+
+The focus editor shows the whole rotated photo with a marker and an outline of the crop for the selected display. The arrows move in the direction shown on screen, even after rotation. `0` removes the manual focus and returns to the configured automatic or center crop. Keeping the edit with `Enter` only updates the draft: press `s` to save it without changing the desktop, or press `Enter` again from the browser to apply it. `Esc` discards only the current focus edit and keeps any earlier draft. Focus affects cover crops; an image that fits without cropping may not visibly move. Switching displays changes the preview only, not which displays receive the wallpaper when you apply it.
+
+In the **framing editor**, `↑`/`↓` change proportional zoom in 5% steps, and `←`/`→` cycle the frame aspect between display, original, 1:1, 4:3, 3:2, 16:9, 9:16, and 21:9. At 100% the photo covers the selected frame; zooming in crops more, while zooming out can expose the backdrop. Press `m` for **stretch** mode: `←`/`→` adjust width and `↑`/`↓` adjust height independently in 5% steps. Stretch can distort the photo. Zoom, width, and height are limited to 25–400%. The editor previews the selected display live and retains the current rotation and crop focus.
+
+Press `0` in the editor to return this pin to legacy framing, `Enter` to stage the edit, or `Esc` to cancel only this editing session (earlier staged edits remain). From the browser, `s` saves all staged adjustments without changing the desktop; `Enter` applies the wallpaper and saves them. `F` is the legacy fill toggle: it clears custom framing while retaining other staged adjustments. Existing wallpapers without custom framing continue to use the previous fit/fill behavior; resetting or clearing framing restores that behavior.
+
+In **Settings**, `Enter` flips an on/off setting immediately, or opens the value for editing (`Ctrl-U` clears the field, `Enter` saves, `Esc` cancels). Saving writes `config.json` but doesn't refresh boards; changing `interval minutes` still needs the agent reinstalled from **More**.
+
+A board that is switched off stays in your list and keeps its downloaded images, but its wallpapers leave the rotation and it isn't re-read from Pinterest until you switch it back on. A pin that is also on another board that is still on stays in rotation. Removing a board deletes its downloaded images; your last board can't be removed.
+
+Only bans, removing a board and installing or removing the background agent ask for confirmation: `y` confirms, anything else cancels. One background action runs at a time and its result appears on the line above the keys; quitting doesn't cancel an action that has already started.
+
+### Preview quality
+
+How sharp the preview is depends on the terminal:
+
+- **Ghostty, Kitty, iTerm2 and WezTerm** show the real image at full resolution. Nothing to configure.
+- **VS Code's terminal** shows the real image only when `terminal.integrated.enableImages` is on and `terminal.integrated.gpuAcceleration` is `auto` or `on`; Pinwall checks for about 100 ms at startup. If VS Code shows inline images elsewhere but Pinwall doesn't pick it up, run `PINTEREST_WALLPAPER_IMAGE=iterm pinwall`.
+- **Everything else** (Apple Terminal, tmux, screen, VS Code without images) gets a picture drawn from coloured block characters, four "pixels" per character. It's a good likeness, not a sharp one; a smaller font or a bigger window gives it more to work with. If your font draws the quarter-block characters badly, `PINTEREST_WALLPAPER_IMAGE=half` uses plain half-blocks, and `PINTEREST_WALLPAPER_IMAGE=blocks` forces block characters even where real images would work.
+
+Block characters use truecolor except in Apple Terminal, where they use 256 colors unless `COLORTERM` explicitly says `truecolor` or `24bit`. Late, complete query replies are filtered from keyboard input. If a terminal sends a malformed reply that never terminates, printable keys can remain buffered even after the initial wait: press an arrow key to resynchronize, then retry the action, or press Ctrl-C to exit. Keys entered while the reply was incomplete may be discarded.
 
 ## Configuration
 
@@ -89,6 +142,7 @@ A manual `next`/`prev` isn't overridden by the agent straight away: the next sch
 | `skip_upscale_over` | `0` | `0` = off. E.g. `3`: pins that would need more than 3× enlargement to fill your largest display are left out, and aren't even downloaded when the board reports their size. |
 | `resolution` | `"auto"` | `"auto"` renders for each display's own size, or set `"3456x2234"` for all of them. |
 | `fit_mode` | `"cover"` | `"cover"` crops to fill the screen. `"blur"` fits the whole image on a backdrop. |
+| `fill_pins` | `[]` | Pin IDs that always use `cover` with no `max_upscale` limit, regardless of those global render settings. For example: `["123456789"]`. The `skip_upscale_over` filter still applies. |
 | `crop` | `"smart"` | Where `cover` crops from. `"smart"` slides the crop towards the side with the most detail when one side clearly has more; otherwise it stays centred. `"center"` always crops evenly. |
 | `max_upscale` | `0` | `0` = no limit. E.g. `2.5`: a pin that would need more enlargement than that is shown smaller, centred on the backdrop, instead of stretched blurry. |
 | `backdrop` | `"blur"` | Background behind fitted images: `"blur"` (blurred copy) or `"color"` (the pin's main colour). |
@@ -96,6 +150,7 @@ A manual `next`/`prev` isn't overridden by the agent straight away: the next sch
 | `menubar_gradient` | `false` | Dark gradient along the top edge so menu-bar text stays readable. |
 | `upscaler` | `""` | Path to [`realesrgan-ncnn-vulkan`](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) to AI-upscale pins needing more than 1.5× enlargement. Runs on two pins per tick, after the wallpaper changes, so it never delays rotation. Keep its `models/` folder next to the binary. Pins it fails on are skipped; delete `upscaled/` to retry. |
 | `upscaler_model` | `"realesrgan-x4plus"` | Model passed to the upscaler with `-n`. |
+| `orientation_model` | `""` | Local ONNX model path. Empty disables [automatic orientation](#automatic-orientation-optional). |
 | `different_per_display` | `false` | Show a different pin on each display instead of the same one everywhere. |
 | `favorite_weight` | `2` | How many times a favorite appears per pass through the deck (spread out, never back to back). |
 | `mood` | `"off"` | `"appearance"`: darker pins in Dark Mode, lighter in Light Mode. `"night"`: darker pins during `night_hours`, lighter otherwise. |
@@ -104,9 +159,40 @@ A manual `next`/`prev` isn't overridden by the agent straight away: the next sch
 | `notifications` | `true` | Notify on new pins, and when a board fails three refreshes in a row. macOS shows them as coming from Script Editor; if none ever appear, allow Script Editor in System Settings → Notifications. |
 | `new_pins_first` | `true` | Show newly added pins before resuming the normal order. |
 
-Render settings (`fit_mode`, `crop`, `max_upscale`, `backdrop`, `sharpen`, `menubar_gradient`, `upscaler`, rotations) take effect on the next wallpaper change; other keys never cause a re-render.
+Render settings (`fit_mode`, `fill_pins`, `crop`, `max_upscale`, `backdrop`, `sharpen`, `menubar_gradient`, `upscaler`, `orientation_model`, rotations) affect subsequent renders.
 
 `./pw status` and the menu bar show each pin's source size and how much it's being enlarged (e.g. `735x418 source, scaled 5.3x to fill 3456x2234`), and `./pw doctor` counts the pins that need more than 2× — a hint to set `max_upscale`, `skip_upscale_over` or an upscaler.
+
+## Automatic orientation (optional)
+
+Automatic orientation corrects sideways or upside-down pins when rendering. It runs locally on your Mac, uploads no images, and never modifies pin source files in `images/`. If the model is unsure, it abstains and the pin renders as-is unless you've set a manual rotation.
+
+1. From the project directory, install ONNX Runtime and NumPy into the Python that `pw` uses. Run the command for your setup:
+
+   ```sh
+   .venv/bin/python3 -m pip install onnxruntime numpy
+   # If you skipped the venv, use this instead:
+   /usr/bin/python3 -m pip install --user onnxruntime numpy
+   ```
+
+   On Python 3.9, you can use `'onnxruntime==1.19.2' 'numpy<2'` in place of `onnxruntime numpy`.
+
+2. From the [pinned upstream v2 release](https://github.com/duartebarbosadev/deep-image-orientation-detection/releases/tag/v2), download the exact model and check its SHA-256:
+
+   ```sh
+   mkdir -p models
+   curl -fL 'https://github.com/duartebarbosadev/deep-image-orientation-detection/releases/download/v2/orientation_model_v2_0.9882.onnx' -o models/orientation.onnx
+   shasum -a 256 models/orientation.onnx
+   ```
+
+   The file must be 80,578,424 bytes and the checksum must be `cffe911c1dff47fbfbbd90110aaab9c07134645c460d35b3ae8832079bea91ba`. `pw` checks both before inference.
+3. Set `"orientation_model": "models/orientation.onnx"` in your existing `config.json`. Relative paths are resolved from the directory containing `config.json`. You don't need to reinstall the launchd agent for this edit.
+4. Run `./pw orient preview` to print the model's clockwise correction (or `abstain`) and score for the first pin on screen. Use `./pw orient preview PIN_ID` for another downloaded pin. Preview neither saves the prediction nor changes the wallpaper. If you don't have any downloaded pins yet, run `./pw refresh` first and provide a pin ID.
+5. Run `./pw orient scan` to cache results for up to four downloaded, unbanned pins that need scanning. Repeat to cover more pins. With a cold cache, setting the model path alone doesn't apply corrections: run a scan or let an eligible tick scan after a successful wallpaper change. Results take effect on subsequent renders, not on the wallpaper already showing.
+
+**Override:** `./pw rotate cw`, `./pw rotate ccw`, or `./pw rotate 180` turns the pin on screen from its current angle and saves a per-pin override. With auto orientation enabled, `./pw rotate reset` forces no extra rotation; `./pw rotate auto` clears the override and falls back to any cached prediction. Append a display number to target another display.
+
+**Disable:** Set `"orientation_model": ""` in `config.json`. Subsequent renders ignore automatic predictions but still honor manual rotations. No launchd reinstall is needed.
 
 ## Menu bar and Raycast
 

@@ -3,7 +3,22 @@
 
 set -euo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")"
+SOURCE="${BASH_SOURCE[0]}"
+if [[ "${SOURCE##*/}" == pinwall && $# -eq 0 ]]; then
+    set -- tui
+fi
+
+while [[ -h "$SOURCE" ]]; do
+    SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+    LINK="$(readlink "$SOURCE")"
+    if [[ "$LINK" = /* ]]; then
+        SOURCE="$LINK"
+    else
+        SOURCE="$SOURCE_DIR/$LINK"
+    fi
+done
+
+cd -P "$(dirname "$SOURCE")"
 
 if [[ -x .venv/bin/python3 ]]; then
     exec .venv/bin/python3 pinterest_wallpaper.py "$@"
