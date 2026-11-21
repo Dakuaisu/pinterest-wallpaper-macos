@@ -5,4 +5,20 @@ target-version = "py39"
 ignore = ["BLE001"]
 
 [lint.isort]
-known-first-party = ["helpers", "pinterest_wallpaper"]
+known-first-party = [
+    "helpers",
+    "pinterest_wallpaper",
+    "wallpaper_http",
+    "wallpaper_orientation",
+    "wallpaper_refresh",
+    "wallpaper_tui",
+    "wallpaper_tui_actions",
+    "wallpaper_tui_backend",
+    "wallpaper_tui_commands",
+    "wallpaper_tui_controls",
+    "wallpaper_tui_graphics",
+    "wallpaper_tui_keys",
+    "wallpaper_tui_preview",
+    "wallpaper_tui_terminal",
+    "wallpaper_tui_view",
+]

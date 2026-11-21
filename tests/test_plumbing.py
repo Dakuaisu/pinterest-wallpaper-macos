@@ -37,10 +37,12 @@ class TextTests(Sandbox):
         self.assertIn("(2h ago)", pw.fmt_time(now - 7300))
         self.assertIn("(3d ago)", pw.fmt_time(now - 3 * 86400 - 5))
 
-    def test_pin_url_only_for_numeric_ids(self):
+    def test_pin_url_for_pin_ids_but_not_legacy_hashes(self):
 
         self.assertEqual(pw.pin_url("123"), "https://www.pinterest.com/pin/123/")
-        self.assertIsNone(pw.pin_url("d41d8cd98f00b204"))
+        self.assertEqual(pw.pin_url("e1_Afq-Shy_9"), "https://www.pinterest.com/pin/e1_Afq-Shy_9/")
+        self.assertIsNone(pw.pin_url("d41d8cd98f00b204e9800998ecf8427e"))
+        self.assertIsNone(pw.pin_url("../x"))
 
     def test_log_lines_are_timestamped_and_split_by_stream(self):
 
@@ -116,13 +118,13 @@ class ConfigValidationTests(Sandbox):
         bad = {
             "boards": [], "interval_minutes": 0, "refresh_hours": -1, "retry_hours": "1",
             "max_pins": 2.5, "skip_video": "yes", "skip_upscale_over": 0.5, "resolution": "big",
-            "fit_mode": "stretch", "crop": "face", "max_upscale": 0.5, "backdrop": "red",
-            "sharpen": 1, "menubar_gradient": None, "upscaler": 5, "upscaler_model": " ",
+            "fit_mode": "stretch", "fill_pins": ["../pin"], "crop": "face", "max_upscale": 0.5, "backdrop": "red",
+            "sharpen": 1, "menubar_gradient": None, "upscaler": 5, "upscaler_model": " ", "orientation_model": 5,
             "different_per_display": "no", "favorite_weight": 11, "mood": "sad",
             "night_hours": [19], "skip_when_locked": 0, "notifications": "on", "new_pins_first": [],
         }
 
-        self.assertEqual(set(bad), set(pw.CONFIG_RULES))
+        self.assertEqual(set(bad), set(pw.CONFIG_RULES) | set(pw.OPTIONAL_CONFIG_RULES))
 
         config, problems = self.load(bad)
 

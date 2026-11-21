@@ -7,6 +7,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import os
 import plistlib
 import random
@@ -30,6 +31,11 @@ import requests
 from PIL import Image, ImageFilter, ImageOps, ImageStat
 from requests.adapters import HTTPAdapter, Retry
 
+import wallpaper_focus
+import wallpaper_framing
+import wallpaper_refresh
+from wallpaper_http import DeadlineExceeded, get_response, is_board_host
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_DIR = os.path.join(BASE_DIR, "images")
 UPSCALED_DIR = os.path.join(BASE_DIR, "upscaled")
@@ -51,9 +57,22 @@ HISTORY_LIMIT = 50
 FALLBACK_SIZE = (2560, 1600)
 MIN_SOURCE_SIDE = 300
 DOWNLOAD_WORKERS = 6
+BOARD_HTTP_BUDGET = 60
+BOARD_PAGE_MAX_BYTES = 4 * 1024 * 1024
+FEED_MAX_BYTES = 2 * 1024 * 1024
+IMAGE_MAX_BYTES = 20 * 1024 * 1024
+MAX_DOWNLOAD_PIXELS = 24_000_000
+REFRESH_TIMEOUT = 120
+MAX_LAUNCH_INTERVAL_SECONDS = (1 << 63) - 1
 ALERT_AFTER_FAILURES = 3
 PLACEHOLDER_BOARD = "YOUR_USERNAME"
+# Pin IDs become filenames: plain digits, or the newer opaque "e1_..." IDs.
+# No dots or slashes, and no leading dash, so a key is always a safe filename.
+PIN_ID = r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}"
+# Version 1 keyed banned pins by md5(url); those aren't pins Pinterest knows.
+LEGACY_KEY = r"[0-9a-f]{32}"
 UPSCALES_PER_TICK = 2
+ORIENTATION_TIMEOUT = 30
 AI_UPSCALE_ABOVE = 1.5
 RENDER_LOOKAHEAD = 5
 DOCTOR_ENLARGEMENT_WARNING = 2
@@ -70,6 +89,7 @@ DEFAULT_CONFIG = {
     "skip_upscale_over": 0,
     "resolution": "auto",
     "fit_mode": "cover",
+    "fill_pins": [],
     "crop": "smart",
     "max_upscale": 0,
     "backdrop": "blur",
@@ -77,6 +97,7 @@ DEFAULT_CONFIG = {
     "menubar_gradient": False,
     "upscaler": "",
     "upscaler_model": "realesrgan-x4plus",
+    "orientation_model": "",
     "different_per_display": False,
     "favorite_weight": 2,
     "mood": "off",
@@ -90,6 +111,7 @@ DEFAULT_STATE = {
     "version": STATE_VERSION,
     "last_refresh_ok": 0,
     "last_refresh_attempt": 0,
+    "refresh_pending": False,
     "board_fails": {},
     "board_names": [],
     "pins": {},
@@ -99,11 +121,19 @@ DEFAULT_STATE = {
     "banned": [],
     "favorites": [],
     "rotations": {},
+    "fill_overrides": {},
+    "crop_focus": {},
+    "framing": {},
+    "orientation_cache": {},
+    "orientation_retry_after": 0,
     "screens": [],
     "last_change": 0,
     "paused_until": 0,
     "on_screen": [],
+    "current": [],
+    "current_screens": [],
     "listings": {},
+    "disabled_boards": [],
 }
 
 USER_AGENT = (
@@ -147,6 +177,7 @@ TRANSPOSE_CW = {
     180: Image.Transpose.ROTATE_180,
     270: Image.Transpose.ROTATE_90,
 }
+focus_point_rotated = wallpaper_focus.focus_point_rotated
 
 
 def make_session():
@@ -157,8 +188,13 @@ def make_session():
         HTTPAdapter(
             max_retries=Retry(
                 total=3,
+                connect=3,
+                read=0,
+                status=0,
+                redirect=0,
                 backoff_factor=0.5,
-                status_forcelist=[429, 500, 502, 503, 504],
+                status_forcelist=(),
+                respect_retry_after_header=False,
             )
         ),
     )
@@ -181,11 +217,22 @@ class Offline(Exception):
     pass
 
 
+class StaleBan(ValueError):
+    pass
+
+
 class BadSource(Exception):
 
     def __init__(self, key, reason):
         super().__init__(reason)
         self.key = key
+
+
+class WallpaperTransactionError(RuntimeError):
+
+    def __init__(self, errors, screens):
+        super().__init__("; ".join(str(error) for error in errors) or "wallpaper transaction failed")
+        self.screens = screens if isinstance(screens, list) else []
 
 
 # =========================
@@ -262,7 +309,11 @@ def fmt_time(stamp):
     if not stamp:
         return "never"
 
-    delta = int(time.time()) - int(stamp)
+    try:
+        local = time.localtime(stamp)
+        delta = int(time.time()) - int(stamp)
+    except (OverflowError, OSError, TypeError, ValueError):
+        return "unknown time"
 
     if delta < 3600:
         ago = f"{delta // 60}m ago"
@@ -271,12 +322,14 @@ def fmt_time(stamp):
     else:
         ago = f"{delta // 86400}d ago"
 
-    return f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(stamp))}  ({ago})"
+    return f"{time.strftime('%Y-%m-%d %H:%M', local)}  ({ago})"
 
 
 def pin_url(key):
 
-    return f"https://www.pinterest.com/pin/{key}/" if key.isdigit() else None
+    is_pin = isinstance(key, str) and re.fullmatch(PIN_ID, key) and not re.fullmatch(LEGACY_KEY, key)
+
+    return f"https://www.pinterest.com/pin/{key}/" if is_pin else None
 
 
 # =========================
@@ -285,7 +338,28 @@ def pin_url(key):
 
 def _number(minimum):
 
-    return lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v >= minimum
+    return lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and _finite_number(v, minimum)
+
+
+def _hours(minimum):
+
+    def valid(value):
+        if not _number(minimum)(value):
+            return False
+        return _finite_number(value * 3600, minimum * 3600)
+
+    return valid
+
+
+def launch_interval_seconds(minutes):
+
+    if not _finite_number(minutes, 1):
+        return None
+    try:
+        seconds = round(minutes * 60)
+    except OverflowError:
+        return None
+    return seconds if 1 <= seconds <= MAX_LAUNCH_INTERVAL_SECONDS else None
 
 
 def _integer(minimum, maximum=None):
@@ -313,14 +387,14 @@ CONFIG_RULES = {
         lambda v: isinstance(v, list) and bool(v) and all(isinstance(b, str) and b.strip() for b in v),
         "a list of board URLs",
     ),
-    "interval_minutes": (_number(1), "a number of minutes, 1 or more"),
-    "refresh_hours": (_number(0.1), "a number of hours"),
-    "retry_hours": (_number(0.1), "a number of hours"),
+    "interval_minutes": (lambda v: launch_interval_seconds(v) is not None, "a number of minutes that fits launchd's interval range"),
+    "refresh_hours": (_hours(0.1), "a number of hours representable in seconds"),
+    "retry_hours": (_hours(0.1), "a number of hours representable in seconds"),
     "max_pins": (_integer(1), "a whole number, 1 or more"),
     "skip_video": (_boolean, "true or false"),
     "skip_upscale_over": (lambda v: _number(0)(v) and (v == 0 or v >= 1), "0 (off) or a number from 1 up"),
     "resolution": (
-        lambda v: isinstance(v, str) and bool(re.fullmatch(r"auto|\d+\s*x\s*\d+", v.strip().lower())),
+        lambda v: isinstance(v, str) and bool(re.fullmatch(r"auto|0*[1-9]\d*\s*x\s*0*[1-9]\d*", v.strip().lower())),
         '"auto" or "WIDTHxHEIGHT"',
     ),
     "fit_mode": (_choice("cover", "blur"), '"cover" or "blur"'),
@@ -343,14 +417,23 @@ CONFIG_RULES = {
     "new_pins_first": (_boolean, "true or false"),
 }
 
+OPTIONAL_CONFIG_RULES = {
+    "orientation_model": (lambda v: isinstance(v, str), 'a local model path, or ""'),
+    "fill_pins": (
+        lambda v: isinstance(v, list) and all(isinstance(pin, str) and re.fullmatch(PIN_ID, pin) for pin in v),
+        "a list of safe pin IDs",
+    ),
+}
 
-def load_config():
+
+def load_config(create=True):
 
     config = copy.deepcopy(DEFAULT_CONFIG)
     problems = []
 
     if not os.path.exists(CONFIG_FILE):
-        save_json(CONFIG_FILE, config)
+        if create:
+            save_json(CONFIG_FILE, config)
         return config, problems
 
     try:
@@ -364,7 +447,7 @@ def load_config():
 
     for key, value in loaded.items():
 
-        rule = CONFIG_RULES.get(key)
+        rule = CONFIG_RULES.get(key) or OPTIONAL_CONFIG_RULES.get(key)
 
         if rule is None:
             problems.append(f"config.json: unknown key {key!r} ignored.")
@@ -401,12 +484,18 @@ def migrate_state(old):
     # v1 stored render filenames in deck/history and md5(url) stems in banned.
     return {
         "version": STATE_VERSION,
-        "banned": [b for b in old.get("banned", []) if isinstance(b, str)],
+        "banned": [b for b in old.get("banned", []) if isinstance(b, str)] if isinstance(old.get("banned", []), list) else [],
         "board_names": old.get("board_names", []),
     }
 
 
 def load_state():
+
+    with file_lock(STATE_LOCK):
+        return _load_state_unlocked()
+
+
+def _load_state_unlocked(repair=True):
 
     state = copy.deepcopy(DEFAULT_STATE)
 
@@ -420,21 +509,204 @@ def load_state():
         return state
 
     except (OSError, ValueError) as e:
+        if not repair:
+            raise ValueError(f".state.json is unreadable ({short(e)})") from e
         backup = f"{STATE_FILE}.corrupt-{int(time.time())}"
-        with contextlib.suppress(OSError):
-            os.replace(STATE_FILE, backup)
+        suffix = 0
+        while os.path.lexists(backup):
+            suffix += 1
+            backup = f"{STATE_FILE}.corrupt-{int(time.time())}-{suffix}"
+        os.replace(STATE_FILE, backup)
         log_error(
             f".state.json is unreadable ({short(e)}); moved it to"
             f" {os.path.basename(backup)} and started fresh."
         )
         return state
 
-    if loaded.get("version") != STATE_VERSION:
+    version = loaded.get("version", 1)
+    if type(version) is not int or version < 1 or version > STATE_VERSION:
+        raise ValueError(f"unsupported state version {version!r}; supported versions are 1 and {STATE_VERSION}")
+
+    if version == 1:
         loaded = migrate_state(loaded)
 
-    state.update(loaded)
+    for key, value in loaded.items():
+        if key in state:
+            parsed = _valid_state_field(key, value)
+            if parsed is not False:
+                state[key] = value if parsed is True else parsed
 
     return state
+
+
+def _finite_number(value, minimum=0):
+
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value >= minimum
+    except OverflowError:
+        return False
+
+
+def _valid_timestamp(value):
+
+    if not _finite_number(value):
+        return False
+    try:
+        time.localtime(value)
+    except (OverflowError, OSError, ValueError):
+        return False
+    return True
+
+
+def _valid_state_field(key, value):
+
+    strings = {"board_names", "seen", "deck", "banned", "favorites", "on_screen"}
+    if key in strings:
+        if not isinstance(value, list):
+            return False
+        if key in {"seen", "deck", "favorites"}:
+            return [item for item in value if isinstance(item, str) and re.fullmatch(PIN_ID, item)]
+        if key == "banned":
+            return [item for item in value if isinstance(item, str) and (re.fullmatch(PIN_ID, item) or re.fullmatch(LEGACY_KEY, item))]
+        return [item for item in value if isinstance(item, str) and (key != "on_screen" or os.path.basename(item) == item)]
+    if key in {"last_refresh_ok", "last_refresh_attempt", "last_change", "orientation_retry_after"}:
+        return _valid_timestamp(value)
+    if key == "paused_until":
+        return _valid_timestamp(value) or value == -1
+    if key == "refresh_pending":
+        return isinstance(value, bool)
+    if key == "history":
+        if not isinstance(value, list):
+            return False
+        rows = [[item for item in row if isinstance(item, str) and re.fullmatch(PIN_ID, item)]
+                for row in value if isinstance(row, list)]
+        return [row for row in rows if row]
+    if key == "current":
+        return [pin if pin is None or isinstance(pin, str) and re.fullmatch(PIN_ID, pin) else None
+                for pin in value] if isinstance(value, list) else False
+    if key == "current_screens":
+        return [screen for screen in value if screen is None or isinstance(screen, (str, int)) and not isinstance(screen, bool)] if isinstance(value, list) else False
+    if key == "rotations":
+        return {pin: angle for pin, angle in value.items() if isinstance(pin, str) and re.fullmatch(PIN_ID, pin)
+                and isinstance(angle, int) and not isinstance(angle, bool) and angle in (0, 90, 180, 270)} if isinstance(value, dict) else False
+    if key == "fill_overrides":
+        return {pin: fill for pin, fill in value.items() if isinstance(pin, str) and re.fullmatch(PIN_ID, pin)
+                and isinstance(fill, bool)} if isinstance(value, dict) else False
+    if key == "crop_focus":
+        if not isinstance(value, dict):
+            return False
+        return {pin: list(point) for pin, raw in value.items()
+                if isinstance(pin, str) and re.fullmatch(PIN_ID, pin)
+                and (point := wallpaper_focus.parse_crop_focus(raw)) is not None}
+    if key == "framing":
+        if not isinstance(value, dict):
+            return False
+        return {pin: framing._asdict() for pin, raw in value.items()
+                if isinstance(pin, str) and re.fullmatch(PIN_ID, pin)
+                and (framing := wallpaper_framing.parse_framing(raw)) is not None}
+    if key == "orientation_cache":
+        return {pin: record for pin, record in value.items() if isinstance(pin, str) and re.fullmatch(PIN_ID, pin)
+                and isinstance(record, dict) and "angle" in record and isinstance(record.get("identity"), str)
+                and (record.get("angle") is None or type(record.get("angle")) is int and record["angle"] in (0, 90, 180, 270))
+                and _finite_number(record.get("score"))} if isinstance(value, dict) else False
+    if key == "pins":
+        if not isinstance(value, dict):
+            return False
+        return {pin: _valid_pin_record(record) for pin, record in value.items()
+                if isinstance(pin, str) and re.fullmatch(PIN_ID, pin) and _valid_pin_record(record) is not False}
+    if key == "screens":
+        if not isinstance(value, list):
+            return False
+        return [screen for screen in value if isinstance(screen, dict) and isinstance(screen.get("name"), str)
+                and isinstance(screen.get("width"), int) and not isinstance(screen.get("width"), bool) and screen["width"] > 0
+                and isinstance(screen.get("height"), int) and not isinstance(screen.get("height"), bool) and screen["height"] > 0
+                and (screen.get("id") is None or isinstance(screen.get("id"), (str, int)) and not isinstance(screen.get("id"), bool))]
+    if key == "board_fails":
+        return isinstance(value, dict) and {url: fail for url, fail in value.items() if isinstance(url, str)
+                and isinstance(fail, dict) and _finite_number(fail.get("count"), 1) and isinstance(fail.get("error"), str)}
+    if key == "disabled_boards":
+        return list(dict.fromkeys(url for url in value if _safe_board_url(url))) if isinstance(value, list) else False
+    if key == "listings":
+        return {url: record for url, record in value.items() if _safe_board_url(url) and _valid_listing_record(record)} if isinstance(value, dict) else False
+    return True
+
+
+def _valid_pin_record(record):
+
+    if (not isinstance(record, dict) or not isinstance(record.get("width"), int) or isinstance(record.get("width"), bool)
+            or not isinstance(record.get("height"), int) or isinstance(record.get("height"), bool)
+            or record["width"] < 1 or record["height"] < 1):
+        return False
+    normalized = {"width": record["width"], "height": record["height"]}
+    if _finite_number(record.get("luma")):
+        normalized["luma"] = record["luma"]
+    if isinstance(record.get("avg"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", record["avg"]):
+        normalized["avg"] = record["avg"]
+    if isinstance(record.get("board"), str) and _safe_board_url(record["board"]):
+        normalized["board"] = record["board"]
+    if isinstance(record.get("boards"), list):
+        normalized["boards"] = list(dict.fromkeys(board for board in record["boards"] if _safe_board_url(board)))
+    if isinstance(record.get("url"), str) and is_pinimg(record["url"]):
+        normalized["url"] = record["url"]
+    color = record.get("color")
+    if isinstance(color, str) and (not color or re.fullmatch(r"#[0-9a-fA-F]{6}", color)):
+        normalized["color"] = color
+    if isinstance(record.get("video"), bool):
+        normalized["video"] = record["video"]
+    return normalized
+
+
+def _safe_board_url(url):
+
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and port in (None, 443) and parts.username is None
+            and parts.password is None and is_board_host(host))
+
+
+def _valid_listing_pin(pin):
+
+    if not isinstance(pin, dict) or not isinstance(pin.get("key"), str) or not re.fullmatch(PIN_ID, pin["key"]):
+        return False
+    if not isinstance(pin.get("url"), str) or not is_pinimg(pin["url"]):
+        return False
+    if not _safe_board_url(pin.get("board")) or not isinstance(pin.get("color"), str) or not isinstance(pin.get("video"), bool):
+        return False
+    for field in ("width", "height"):
+        if not isinstance(pin.get(field), int) or isinstance(pin[field], bool) or pin[field] < 0:
+            return False
+    fallbacks = pin.get("fallbacks", [])
+    return isinstance(fallbacks, list) and all(isinstance(url, str) and is_pinimg(url) for url in fallbacks)
+
+
+def _valid_listing_record(record):
+
+    if not isinstance(record, dict) or not isinstance(record.get("pins"), list) or not all(
+        _valid_listing_pin(pin) for pin in record["pins"]
+    ):
+        return False
+    stamp = record.get("stamp")
+    if not isinstance(stamp, dict):
+        return False
+    if not isinstance(stamp.get("max_pins"), int) or isinstance(stamp.get("max_pins"), bool) or stamp["max_pins"] < 1:
+        return False
+    if not isinstance(stamp.get("first_page"), list) or not all(
+        isinstance(pin, str) and re.fullmatch(PIN_ID, pin) for pin in stamp["first_page"]
+    ):
+        return False
+    count = stamp.get("pin_count")
+    modified = stamp.get("modified")
+    if count is not None and (not isinstance(count, int) or isinstance(count, bool) or count < 0):
+        return False
+    return modified is None or isinstance(modified, str) or _finite_number(modified)
 
 
 def save_state(state):
@@ -469,17 +741,25 @@ def locked_state():
 
     with file_lock(STATE_LOCK):
 
-        state = load_state()
+        state = _load_state_unlocked()
 
+        save = True
         try:
             yield state
+        except StaleBan:
+            save = False
+            raise
         finally:
-            save_state(state)
+            if save:
+                save_state(state)
 
 
 def current_pins(state):
 
-    return list(state["history"][-1]) if state["history"] else []
+    if state["current"]:
+        return list(state["current"])
+    previous = list(state["history"][-1]) if state["history"] else []
+    return previous * len(state["screens"]) if len(previous) == 1 and len(state["screens"]) > 1 else previous
 
 
 def pin_on_display(state, display):
@@ -492,7 +772,9 @@ def pin_on_display(state, display):
     if display > max(len(pins), len(state["screens"])):
         raise ValueError(f"there's no display {display} (see ./pw status)")
 
-    return pins[(display - 1) % len(pins)]
+    if display > len(pins):
+        return None
+    return pins[display - 1]
 
 
 def is_paused(state):
@@ -524,23 +806,44 @@ JSON.stringify(out);
 JXA_SET_WALLPAPERS = """
 ObjC.import("AppKit");
 function run(argv) {
-  var ws = $.NSWorkspace.sharedWorkspace, screens = $.NSScreen.screens, errors = [];
+  var ws = $.NSWorkspace.sharedWorkspace, screens = $.NSScreen.screens, plan = [], errors = [], changed = [];
+  function screenID(sc) { return String(ObjC.unwrap(sc.deviceDescription.objectForKey("NSScreenNumber"))); }
+  function imagePath(url) { return url ? String(ObjC.unwrap(url.path)) : ""; }
   for (var j = 0; j + 1 < argv.length; j += 2) {
-    var target = argv[j], url = $.NSURL.fileURLWithPath(argv[j + 1]), hit = false;
+    var target = argv[j], hit = false;
     for (var i = 0; i < screens.count; i++) {
-      var sc = screens.objectAtIndex(i);
-      var id = String(ObjC.unwrap(sc.deviceDescription.objectForKey("NSScreenNumber")));
+      var sc = screens.objectAtIndex(i), id = screenID(sc);
       if (target !== "*" && id !== target) continue;
       hit = true;
-      var err = Ref();
-      if (!ws.setDesktopImageURLForScreenOptionsError(url, sc, $({}), err)) {
-        errors.push(argv[j + 1] + ": " + (err[0] ? ObjC.unwrap(err[0].localizedDescription) : "failed"));
-      }
+      var path = argv[j + 1];
+      if (!$.NSFileManager.defaultManager.fileExistsAtPath($(path))) errors.push("missing render " + path);
+      plan.push({screen: sc, id: id, path: path, url: $.NSURL.fileURLWithPath(path),
+                 oldURL: ws.desktopImageURLForScreen(sc), oldOptions: ws.desktopImageOptionsForScreen(sc)});
     }
     if (!hit) errors.push("no display with id " + target);
   }
-  if (errors.length) throw new Error(errors.join("; "));
-  return "ok";
+  if (errors.length) return JSON.stringify({ok:false, errors:errors, screens:[]});
+  for (var p = 0; p < plan.length; p++) {
+    var item = plan[p], err = Ref();
+    changed.push(item);
+    if (!ws.setDesktopImageURLForScreenOptionsError(item.url, item.screen, item.oldOptions, err)) {
+      errors.push(item.id + ": " + (err[0] ? ObjC.unwrap(err[0].localizedDescription) : "failed"));
+      break;
+    }
+  }
+  if (errors.length) {
+    for (var r = changed.length - 1; r >= 0; r--) {
+      var prior = changed[r], rollbackError = Ref();
+      if (!ws.setDesktopImageURLForScreenOptionsError(prior.oldURL, prior.screen, prior.oldOptions, rollbackError))
+        errors.push("rollback " + prior.id + ": " + (rollbackError[0] ? ObjC.unwrap(rollbackError[0].localizedDescription) : "failed"));
+    }
+  }
+  var outcomes = [];
+  for (var q = 0; q < plan.length; q++) {
+    var targetItem = plan[q], actual = ws.desktopImageURLForScreen(targetItem.screen);
+    outcomes.push({id:targetItem.id, path:imagePath(actual)});
+  }
+  return JSON.stringify({ok:errors.length === 0, errors:errors, screens:outcomes});
 }
 """
 
@@ -617,7 +920,14 @@ def set_wallpapers(assignment):
 
         args += ["*" if screen.get("id") is None else str(screen["id"]), path]
 
-    osascript(["-l", "JavaScript", "-e", JXA_SET_WALLPAPERS, *args])
+    result = osascript(["-l", "JavaScript", "-e", JXA_SET_WALLPAPERS, *args])
+    if isinstance(result, str) and result:
+        try:
+            transaction = json.loads(result)
+        except ValueError as error:
+            raise RuntimeError("osascript returned an invalid wallpaper transaction result") from error
+        if isinstance(transaction, dict) and transaction.get("ok") is False:
+            raise WallpaperTransactionError(transaction.get("errors", []), transaction.get("screens", []))
 
 
 def screen_locked():
@@ -675,12 +985,16 @@ def notify(config, title, message):
 
 def launchctl_interval(label):
 
-    result = subprocess.run(
-        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"launchctl status probe failed for {label}: {short(error)}") from error
 
     if result.returncode != 0:
         return None
@@ -731,11 +1045,10 @@ def pin_from_feed(item, board_url):
     if not isinstance(item, dict) or item.get("type") != "pin":
         return None
 
-    # Pin IDs become filenames, so anything but plain digits is refused.
     pin_id = str(item.get("id") or "")
     images = item.get("images")
 
-    if not re.fullmatch(r"[0-9]{1,30}", pin_id) or not isinstance(images, dict):
+    if not re.fullmatch(PIN_ID, pin_id) or not isinstance(images, dict):
         return None
 
     for quality in ("orig", "736x", "474x"):
@@ -781,10 +1094,19 @@ def dedupe(pins):
 
 def more_pages(bookmark):
 
-    return bool(bookmark) and bookmark != "-end-"
+    return _bookmark_state(bookmark) is True
 
 
-def paginate(board_url, feed_key, bookmark, pins, max_pins):
+def _bookmark_state(bookmark):
+
+    if bookmark is None:
+        return False
+    if not isinstance(bookmark, str):
+        return None
+    return bookmark not in ("", "-end-")
+
+
+def paginate(board_url, feed_key, bookmark, pins, max_pins, deadline=None):
 
     path = urllib.parse.urlparse(board_url).path
 
@@ -796,7 +1118,16 @@ def paginate(board_url, feed_key, bookmark, pins, max_pins):
 
     headers = dict(API_HEADERS, **{"X-Pinterest-Source-Url": path})
 
-    while more_pages(bookmark) and len(pins) < max_pins:
+    state = _bookmark_state(bookmark)
+    if state is None:
+        return False
+    bookmarks = set()
+    while state and len(pins) < max_pins:
+
+        if not isinstance(bookmark, str) or bookmark in bookmarks or len(bookmarks) >= 100:
+            log_error(f"{board_url}: stopped paging after {len(pins)} pins (Pinterest repeated a page).")
+            return False
+        bookmarks.add(bookmark)
 
         data = json.dumps(
             {"options": dict(options, bookmarks=[bookmark]), "context": {}},
@@ -804,28 +1135,50 @@ def paginate(board_url, feed_key, bookmark, pins, max_pins):
         )
 
         try:
-            response = SESSION.get(
+            response = get_response(
+                SESSION,
                 FEED_API,
                 params={"source_url": path, "data": data},
                 headers=headers,
+                kind="feed",
+                max_bytes=FEED_MAX_BYTES,
+                deadline=deadline,
                 timeout=30,
             )
             response.raise_for_status()
-            body = response.json()["resource_response"]
+            payload = response.json()
+            body = payload["resource_response"]
+            if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+                raise TypeError("unexpected feed response")
+            # The last page has no bookmark of its own; Pinterest marks the end in the echoed request options.
+            following = body["bookmark"] if "bookmark" in body else payload["resource"]["options"]["bookmarks"][0]
+            next_state = _bookmark_state(following)
+            if next_state is None:
+                raise ValueError("unexpected feed bookmark")
 
         except Exception as e:
             log_error(f"{board_url}: stopped paging after {len(pins)} pins ({short(e)}).")
             return False
 
-        pins.extend(p for p in (pin_from_feed(i, board_url) for i in body.get("data") or []) if p)
-        bookmark = body.get("bookmark")
+        for item in body["data"]:
+            pin = pin_from_feed(item, board_url)
+            if not isinstance(item, dict) or item.get("type") == "pin" and not pin:
+                log_error(f"{board_url}: stopped paging after {len(pins)} pins (a pin couldn't be read).")
+                return False
+            if pin:
+                pins.append(pin)
+        pins[:] = dedupe(pins)
+        bookmark = following
+        state = next_state
 
     return True
 
 
-def scrape_board(board_url, max_pins, previous=None):
+def scrape_board(board_url, max_pins, previous=None, deadline=None):
 
-    response = SESSION.get(board_url, headers=PAGE_HEADERS, timeout=30)
+    deadline = time.monotonic() + BOARD_HTTP_BUDGET if deadline is None else deadline
+    response = get_response(SESSION, board_url, headers=PAGE_HEADERS, kind="board",
+                            max_bytes=BOARD_PAGE_MAX_BYTES, deadline=deadline, timeout=30)
     response.raise_for_status()
 
     resources = parse_initial_props(response.text)["initialReduxState"]["resources"]
@@ -833,7 +1186,7 @@ def scrape_board(board_url, max_pins, previous=None):
     feed_key, feed = None, None
 
     for key, value in resources.get("BoardFeedResource", {}).items():
-        if isinstance(value, dict) and isinstance(value.get("data"), list) and value["data"]:
+        if isinstance(value, dict) and isinstance(value.get("data"), list):
             feed_key, feed = key, value
             break
 
@@ -847,7 +1200,14 @@ def scrape_board(board_url, max_pins, previous=None):
             board = value["data"]
             break
 
-    pins = [p for p in (pin_from_feed(i, board_url) for i in feed["data"]) if p]
+    bookmark_status = _bookmark_state(feed.get("nextBookmark")) if "nextBookmark" in feed else None
+    if not feed["data"] and not (
+        type(board.get("pin_count")) is int and board["pin_count"] == 0 and bookmark_status is False
+    ):
+        raise RuntimeError("board feed contained no pins")
+
+    parsed = [(item, pin_from_feed(item, board_url)) for item in feed["data"]]
+    pins = dedupe([pin for _, pin in parsed if pin])
     # Enough to tell that a board hasn't changed without paging through all of it again.
     stamp = {
         "pin_count": board.get("pin_count"),
@@ -855,13 +1215,16 @@ def scrape_board(board_url, max_pins, previous=None):
         "max_pins": max_pins,
         "first_page": [p["key"] for p in pins],
     }
-    paged = more_pages(feed.get("nextBookmark")) and len(pins) < max_pins
-    complete, reused = True, False
+    paged = bookmark_status is True and len(pins) < max_pins
+    complete = bookmark_status is not None and not any(
+        not isinstance(item, dict) or item.get("type") == "pin" and not pin for item, pin in parsed
+    )
+    reused = False
 
     if paged and previous and previous.get("stamp") == stamp:
         pins, reused = [dict(p) for p in previous["pins"]], True
     elif paged:
-        complete = paginate(board_url, feed_key, feed["nextBookmark"], pins, max_pins)
+        complete = paginate(board_url, feed_key, feed["nextBookmark"], pins, max_pins, deadline) and complete
 
     return {
         "url": board_url,
@@ -875,9 +1238,11 @@ def scrape_board(board_url, max_pins, previous=None):
     }
 
 
-def scrape_board_rss(board_url, max_pins):
+def scrape_board_rss(board_url, max_pins, deadline=None):
 
-    response = SESSION.get(board_url.rstrip("/") + ".rss", headers=PAGE_HEADERS, timeout=30)
+    deadline = time.monotonic() + BOARD_HTTP_BUDGET if deadline is None else deadline
+    response = get_response(SESSION, board_url.rstrip("/") + ".rss", headers=PAGE_HEADERS, kind="rss",
+                            max_bytes=BOARD_PAGE_MAX_BYTES, deadline=deadline, timeout=30)
     response.raise_for_status()
 
     pins = []
@@ -885,7 +1250,7 @@ def scrape_board_rss(board_url, max_pins):
     for item in re.findall(r"<item>(.*?)</item>", response.text, re.DOTALL):
 
         item = html.unescape(item)
-        pin_id = re.search(r"/pin/(\d+)", item)
+        pin_id = re.search(rf"/pin/({PIN_ID})(?![A-Za-z0-9_-])", item)
         thumb = re.search(r"https://i\.pinimg\.com/\d+x/[0-9a-f/]+\.(?:jpg|png)", item)
 
         if pin_id and thumb:
@@ -924,8 +1289,13 @@ def scrape_board_rss(board_url, max_pins):
 
 def fetch_board(board_url, max_pins, previous=None):
 
+    deadline = time.monotonic() + BOARD_HTTP_BUDGET
+
     try:
-        return scrape_board(board_url, max_pins, previous)
+        return scrape_board(board_url, max_pins, previous, deadline)
+    except DeadlineExceeded as e:
+        # A server that answers too slowly is reachable, so this isn't the laptop being offline.
+        raise requests.exceptions.RetryError(short(e)) from e
     except NETWORK_ERRORS as e:
         raise Offline(short(e)) from e
     except requests.exceptions.RetryError:
@@ -935,7 +1305,9 @@ def fetch_board(board_url, max_pins, previous=None):
         log_error(f"{board_url}: page scrape failed ({short(e)}); falling back to RSS.")
 
     try:
-        return scrape_board_rss(board_url, max_pins)
+        return scrape_board_rss(board_url, max_pins, deadline)
+    except DeadlineExceeded as e:
+        raise requests.exceptions.RetryError(short(e)) from e
     except NETWORK_ERRORS as e:
         raise Offline(short(e)) from e
 
@@ -989,9 +1361,11 @@ def source_files():
 def download_source(pin):
 
     urls = [pin["url"], *pin.get("fallbacks", [])]
+    deadline = time.monotonic() + 45
 
     for number, url in enumerate(urls, 1):
-        response = worker_session().get(url, headers=IMAGE_HEADERS, timeout=30)
+        response = get_response(worker_session(), url, headers=IMAGE_HEADERS, kind="image",
+                                max_bytes=IMAGE_MAX_BYTES, deadline=deadline, timeout=30)
         if response.status_code not in (403, 404) or number == len(urls):
             break
 
@@ -1001,6 +1375,10 @@ def download_source(pin):
 
     if not content_type.startswith("image/"):
         raise ValueError(f"not an image ({content_type or 'no content type'})")
+
+    with Image.open(io.BytesIO(response.content)) as header:
+        if header.width * header.height > MAX_DOWNLOAD_PIXELS:
+            raise ValueError(f"image exceeds pixel limit ({header.width}x{header.height})")
 
     # A full decode, so a truncated body never makes it into the cache.
     img, _, fmt = decode(io.BytesIO(response.content))
@@ -1068,6 +1446,141 @@ def run_upscaler(binary, model, src, out):
             save_jpeg(upscaled.convert("RGB"), out, icc)
 
 
+_digest_cache = {}
+
+
+def _file_digest(path):
+
+    stat = os.stat(path)
+    identity = (os.path.realpath(path), stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    if identity not in _digest_cache:
+        _digest_cache[identity] = _hash_file(path)
+    return _digest_cache[identity]
+
+
+def _hash_file(path):
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def orientation_backend(config):
+    model = config.get("orientation_model", "").strip()
+    if not model:
+        raise ValueError("orientation_model is empty; configure a local model first")
+    model = os.path.abspath(os.path.join(os.path.dirname(CONFIG_FILE), os.path.expanduser(model)))
+    try:
+        import wallpaper_orientation
+    except ImportError as error:
+        raise ValueError(f"orientation backend unavailable: {short(error)}") from error
+    try:
+        stat = os.stat(model)
+    except OSError as error:
+        raise ValueError(f"orientation model unavailable: {short(error)}") from error
+    token = [os.path.realpath(model), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+             wallpaper_orientation.CACHE_VERSION, wallpaper_orientation.MODEL_SHA256]
+    return wallpaper_orientation, model, token
+
+
+def orientation_identity(source, token):
+    return json.dumps([_file_digest(source), token], separators=(",", ":"))
+
+
+def effective_angle(key, config, state, files=None):
+    if key in state["rotations"]:
+        return state["rotations"][key]
+    if not config.get("orientation_model"):
+        return 0
+    record = state.get("orientation_cache", {}).get(key)
+    if not record:
+        return 0
+    try:
+        _, _, token = orientation_backend(config)
+        files = source_files() if files is None else files
+        source = os.path.join(IMAGE_DIR, files[key])
+        if record["identity"] == orientation_identity(source, token):
+            return record["angle"] or 0
+    except (ValueError, OSError, KeyError):
+        return 0
+    return 0
+
+
+def orient_batch(config, snapshot, explicit=False):
+    backend, model, token = orientation_backend(config)
+    files = source_files()
+    keys = list(dict.fromkeys(snapshot["deck"] + list(snapshot["pins"])))
+    work = []
+    for key in keys:
+        if key not in snapshot["pins"] or key not in files or key in snapshot["banned"]:
+            continue
+        source = os.path.join(IMAGE_DIR, files[key])
+        try:
+            identity = orientation_identity(source, token)
+        except OSError:
+            continue
+        if snapshot.get("orientation_cache", {}).get(key, {}).get("identity") != identity:
+            work.append((key, source, identity))
+        if len(work) == 4:
+            break
+    if not work:
+        return 0
+    try:
+        predictions = backend.predict(model, [item[1] for item in work], timeout=ORIENTATION_TIMEOUT)
+        if len(predictions) != len(work):
+            raise backend.OrientationError("orientation backend returned the wrong number of results")
+    except (backend.OrientationError, OSError) as error:
+        if explicit:
+            raise ValueError(f"orientation failed: {short(error)}") from error
+        with locked_state() as state:
+            state["orientation_retry_after"] = time.time() + 3600
+        log_error(f"Orientation failed; retrying after one hour ({short(error)}).")
+        return 0
+    failed = False
+    count = 0
+    with locked_state() as state:
+        try:
+            _, _, current_token = orientation_backend(config)
+        except ValueError:
+            return 0
+        current_files = source_files()
+        for (key, source, identity), prediction in zip(work, predictions):
+            if prediction is None:
+                failed = True
+            if key not in state["pins"]:
+                continue
+            try:
+                if key not in current_files or os.path.join(IMAGE_DIR, current_files[key]) != source:
+                    continue
+                if orientation_identity(source, current_token) != identity:
+                    continue
+            except OSError:
+                continue
+            # An unreadable image is remembered as an abstention, or four of them would be rescanned forever.
+            state["orientation_cache"][key] = (
+                {"identity": identity, "angle": None, "score": 0.0} if prediction is None
+                else {"identity": identity, "angle": prediction.angle, "score": prediction.score}
+            )
+            count += prediction is not None
+        state["orientation_retry_after"] = 0
+    if failed and explicit:
+        raise ValueError("orientation could not read one or more images; successful results were saved")
+    return count
+
+
+def upscale_cache_paths(key, binary, model, source):
+
+    executable = os.path.realpath(binary)
+    stat = os.stat(executable)
+    identity = json.dumps([executable, stat.st_size, stat.st_mtime_ns, _file_digest(executable), model,
+                           os.path.realpath(source), _file_digest(source)], separators=(",", ":"))
+    tag = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    prefix = os.path.join(UPSCALED_DIR, key + ".")
+    return prefix + tag + ".jpg", prefix + tag + ".failed", prefix
+
+
 def upscale_sources(config, state, files, limit):
 
     binary = config["upscaler"]
@@ -1082,25 +1595,36 @@ def upscale_sources(config, state, files, limit):
     target = largest_screen(config, state)
     banned = set(state["banned"])
     attempted = 0
+    cached = {}
+
+    for name in os.listdir(UPSCALED_DIR):
+        cached.setdefault(name.split(".")[0], []).append(name)
 
     for key, meta in state["pins"].items():
 
         if attempted >= limit:
             break
 
-        out = os.path.join(UPSCALED_DIR, key + ".jpg")
-        failed = os.path.join(UPSCALED_DIR, key + ".failed")
-
-        if key not in files or key in banned or os.path.exists(out) or os.path.exists(failed):
+        if key not in files or key in banned:
             continue
 
-        if enlargement(meta, state["rotations"].get(key, 0), target) <= AI_UPSCALE_ABOVE:
+        source = os.path.join(IMAGE_DIR, files[key])
+        out, failed, _ = upscale_cache_paths(key, binary, config["upscaler_model"], source)
+
+        for name in cached.get(key, ()):
+            if name not in (os.path.basename(out), os.path.basename(failed)):
+                remove_quietly(os.path.join(UPSCALED_DIR, name))
+
+        if os.path.exists(out) or os.path.exists(failed):
+            continue
+
+        if enlargement(meta, effective_angle(key, config, state, files), target) <= AI_UPSCALE_ABOVE:
             continue
 
         attempted += 1
 
         try:
-            run_upscaler(binary, config["upscaler_model"], os.path.join(IMAGE_DIR, files[key]), out)
+            run_upscaler(binary, config["upscaler_model"], source, out)
             log(f"Upscaled pin {key} with {config['upscaler_model']}.")
         except Exception as e:
             reason = short(e)
@@ -1115,9 +1639,15 @@ def upscale_sources(config, state, files, limit):
 
 def source_for(key, config, files):
 
-    upscaled = os.path.join(UPSCALED_DIR, key + ".jpg")
+    upscaled = None
+    if config["upscaler"] and key in files and os.access(config["upscaler"], os.X_OK):
+        try:
+            upscaled = upscale_cache_paths(key, config["upscaler"], config["upscaler_model"],
+                                           os.path.join(IMAGE_DIR, files[key]))[0]
+        except OSError:
+            upscaled = None
 
-    if config["upscaler"] and os.path.exists(upscaled):
+    if upscaled and os.path.exists(upscaled):
         return upscaled, True
 
     if key not in files:
@@ -1126,19 +1656,28 @@ def source_for(key, config, files):
     return os.path.join(IMAGE_DIR, files[key]), False
 
 
-def render_settings(key, config, state, ai):
+def render_settings(key, config, state, ai, files=None):
 
-    return {
+    fill = state.get("fill_overrides", {}).get(key, key in config.get("fill_pins", []))
+    settings = {
         "v": RENDER_VERSION,
-        "fit": config["fit_mode"],
+        "fit": "cover" if fill else config["fit_mode"],
         "crop": config["crop"],
         "backdrop": config["backdrop"],
+        "color": state["pins"].get(key, {}).get("color") if config["backdrop"] == "color" else None,
         "sharpen": config["sharpen"],
         "menubar": config["menubar_gradient"],
-        "max_upscale": config["max_upscale"],
-        "rotate": state["rotations"].get(key, 0),
+        "max_upscale": 0 if fill else config["max_upscale"],
+        "rotate": effective_angle(key, config, state, files),
         "ai": config["upscaler_model"] if ai else "",
     }
+    focus = wallpaper_focus.parse_crop_focus(state.get("crop_focus", {}).get(key))
+    if focus is not None:
+        settings["crop_focus"] = focus
+    framing = wallpaper_framing.parse_framing(state.get("framing", {}).get(key))
+    if framing is not None:
+        settings["framing"] = framing._asdict()
+    return settings
 
 
 def settings_tag(settings):
@@ -1154,20 +1693,21 @@ def render_name(key, size, tag):
 def expected_render(key, size, config, state, files):
 
     src, ai = source_for(key, config, files)
-    settings = render_settings(key, config, state, ai)
+    settings = render_settings(key, config, state, ai, files)
+    settings["source_identity"] = [os.path.basename(src), _file_digest(src)]
 
     return src, settings, os.path.join(WALLPAPERS_DIR, render_name(key, size, settings_tag(settings)))
 
 
-def sharpen(img):
+def sharpen(img, radius=1.6):
 
-    return img.filter(ImageFilter.UnsharpMask(radius=1.6, percent=110, threshold=3))
+    return img.filter(ImageFilter.UnsharpMask(radius=radius, percent=110, threshold=3))
 
 
-def add_menubar_gradient(img, strength=135):
+def add_menubar_gradient(img, strength=135, minimum_band=48):
 
     width, height = img.size
-    band = max(48, height // 20)
+    band = max(minimum_band, height // 20)
 
     column = Image.new("L", (1, band))
 
@@ -1182,7 +1722,7 @@ def add_menubar_gradient(img, strength=135):
     return shaded
 
 
-def make_backdrop(img, size, style, color):
+def make_backdrop(img, size, style, color, blur_radius=40):
 
     if style == "color":
 
@@ -1191,7 +1731,7 @@ def make_backdrop(img, size, style, color):
 
         return Image.new("RGB", size, color)
 
-    return ImageOps.fit(img, size, method=Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(40))
+    return ImageOps.fit(img, size, method=Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(blur_radius))
 
 
 def smart_centering(img, size):
@@ -1239,42 +1779,75 @@ def smart_centering(img, size):
     return (best / slack, 0.5) if wide else (0.5, best / slack)
 
 
-def render_image(img, size, settings, color=None):
+def cover_crop_box(
+    img: Image.Image, target_size: tuple[int, int], settings: wallpaper_focus.CropSettings,
+) -> tuple[float, float, float, float]:
+    """Return source pixel edges on the already-rotated image, or full bounds for fit."""
+    if wallpaper_framing.parse_framing(settings.get("framing")) is not None:
+        return wallpaper_framing.geometry(img.size, target_size, settings).source
+    box = wallpaper_focus.cover_crop(img, target_size, settings, smart_centering=smart_centering)
+    return box if box is not None else (0, 0, img.width, img.height)
+
+
+def render_image(img, size, settings, color=None, reference_size=None):
 
     width, height = size
+    reference_width, reference_height = reference_size or size
+    preview_scale = min(width / reference_width, height / reference_height)
 
     if settings["rotate"]:
         img = img.transpose(TRANSPOSE_CW[settings["rotate"]])
 
-    cover = max(width / img.width, height / img.height)
+    if wallpaper_framing.parse_framing(settings.get("framing")) is not None:
+        geometry = wallpaper_framing.geometry(img.size, (reference_width, reference_height), settings, size)
+        left, top, right, bottom = geometry.destination
+        photo = img.resize((right - left, bottom - top), Image.Resampling.LANCZOS, box=geometry.source)
+        if settings["sharpen"] and (reference_width > img.width or reference_height > img.height):
+            photo = sharpen(photo) if reference_size is None else sharpen(photo, 1.6 * preview_scale)
+        if (left, top, right, bottom) == (0, 0, width, height):
+            out = photo
+        else:
+            out = (make_backdrop(img, size, settings["backdrop"], color) if reference_size is None else
+                   make_backdrop(img, size, settings["backdrop"], color, 40 * preview_scale))
+            out.paste(photo, (left, top))
+        if settings["menubar"]:
+            out = (add_menubar_gradient(out) if reference_size is None else
+                   add_menubar_gradient(out, minimum_band=max(1, round(48 * preview_scale))))
+        return out
+
     limit = settings["max_upscale"] or float("inf")
+    box = wallpaper_focus.cover_crop(img, (reference_width, reference_height), settings,
+                                    smart_centering=smart_centering, output_size=size)
 
-    if settings["fit"] == "cover" and cover <= limit:
+    if box is not None:
 
-        centering = smart_centering(img, size) if settings["crop"] == "smart" else (0.5, 0.5)
-        out = ImageOps.fit(img, size, method=Image.Resampling.LANCZOS, centering=centering)
+        out = img.resize(size, Image.Resampling.LANCZOS, box=box)
 
-        if settings["sharpen"] and cover > 1:
-            out = sharpen(out)
+        if settings["sharpen"] and (reference_width > img.width or reference_height > img.height):
+            out = sharpen(out) if reference_size is None else sharpen(out, 1.6 * preview_scale)
 
     else:
 
-        scale = min(width / img.width, height / img.height, limit)
+        scale = min(reference_width / img.width, reference_height / img.height, limit)
 
         photo = img.resize(
-            (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+            (max(1, round(img.width * scale * preview_scale)), max(1, round(img.height * scale * preview_scale))),
             Image.Resampling.LANCZOS,
         )
 
         # Only the photo is sharpened; the backdrop is meant to stay soft.
         if settings["sharpen"] and scale > 1:
-            photo = sharpen(photo)
+            photo = sharpen(photo) if reference_size is None else sharpen(photo, 1.6 * preview_scale)
 
-        out = make_backdrop(img, size, settings["backdrop"], color)
+        if reference_size is None:
+            out = make_backdrop(img, size, settings["backdrop"], color)
+        else:
+            out = make_backdrop(img, size, settings["backdrop"], color, 40 * preview_scale)
         out.paste(photo, ((width - photo.width) // 2, (height - photo.height) // 2))
 
     if settings["menubar"]:
-        out = add_menubar_gradient(out)
+        out = (add_menubar_gradient(out) if reference_size is None else
+               add_menubar_gradient(out, minimum_band=max(1, round(48 * preview_scale))))
 
     return out
 
@@ -1289,6 +1862,9 @@ def ensure_render(key, size, config, state, files):
     try:
         img, icc, _ = decode(src)
     except Exception as e:
+        if src.startswith(os.path.join(UPSCALED_DIR, key + ".")):
+            remove_quietly(src)
+            return ensure_render(key, size, config, state, files)
         raise BadSource(key, short(e)) from e
 
     save_jpeg(render_image(img, size, settings, state["pins"].get(key, {}).get("color")), out, icc)
@@ -1316,7 +1892,9 @@ def forget_source(key, files):
     if key in files:
         remove_quietly(os.path.join(IMAGE_DIR, files.pop(key)))
 
-    remove_quietly(os.path.join(UPSCALED_DIR, key + ".jpg"))
+    for name in os.listdir(UPSCALED_DIR):
+        if name.startswith(key + "."):
+            remove_quietly(os.path.join(UPSCALED_DIR, name))
 
 
 def prune_dir(directory, keep):
@@ -1350,8 +1928,18 @@ def prune_dir(directory, keep):
 def sync_boards(config, snapshot):
 
     listings, failures, offline = [], {}, []
+    retry = False
+
+    disabled = set(snapshot.get("disabled_boards", ()))
+
+    if disabled & set(config["boards"]):
+        log(f"Skipped {len(disabled & set(config['boards']))} board(s) that are switched off.")
 
     for board_url in config["boards"]:
+
+        # Never listed, so a switched-off board keeps its pins and images, like one that failed to load.
+        if board_url in disabled:
+            continue
 
         try:
             listing = fetch_board(board_url, config["max_pins"], snapshot["listings"].get(board_url))
@@ -1362,6 +1950,7 @@ def sync_boards(config, snapshot):
             continue
 
         except requests.exceptions.RetryError as e:
+            retry = True
             log(f"{board_url}: Pinterest is rate-limiting or unavailable ({short(e)}); will retry later.")
             continue
 
@@ -1381,7 +1970,7 @@ def sync_boards(config, snapshot):
 
         log(f"Board: {listing['name']} ({listing['pin_count'] or '?'} pins, {len(listing['pins'])} listed{note})")
 
-    if offline and not listings and not failures:
+    if offline and not listings and not failures and not retry:
         raise Offline("no board could be reached")
 
     pins = dedupe([pin for listing in listings for pin in listing["pins"]])
@@ -1396,7 +1985,11 @@ def sync_boards(config, snapshot):
     target = largest_screen(config, snapshot)
 
     def too_small(key, size):
-        return bool(limit) and enlargement(size, snapshot["rotations"].get(key, 0), target) > limit
+        if not limit:
+            return False
+        if config.get("orientation_model") and key not in snapshot["rotations"]:
+            return min(enlargement(size, 0, target), enlargement(size, 90, target)) > limit
+        return enlargement(size, snapshot["rotations"].get(key, 0), target) > limit
 
     skipped = {pin["key"] for pin in pins if too_small(pin["key"], pin)}
     files = source_files()
@@ -1405,6 +1998,7 @@ def sync_boards(config, snapshot):
 
     todo = [pin for pin in pins if pin["key"] not in files and pin["key"] not in skipped]
     failed = 0
+    retained = set()
 
     with ThreadPoolExecutor(DOWNLOAD_WORKERS) as pool:
 
@@ -1412,6 +2006,7 @@ def sync_boards(config, snapshot):
 
             if error is not None:
                 failed += 1
+                retained.add(pin["key"])
                 log_error(f"Pin {pin['key']}: download failed ({short(error)}).")
                 continue
 
@@ -1441,6 +2036,8 @@ def sync_boards(config, snapshot):
             except Exception as e:
                 log_error(f"Pin {key}: cached image is unreadable ({short(e)}); re-downloading next time.")
                 forget_source(key, files)
+                retained.add(key)
+                retry = True
                 continue
 
         # RSS pins arrive without a size, so they can only be judged once downloaded.
@@ -1458,7 +2055,18 @@ def sync_boards(config, snapshot):
         "failures": failures,
         "offline": offline,
         "pins": available,
+        "retained": sorted(retained),
+        "retry": retry or bool(failed),
     }
+
+
+def sync_with_deadline(config, snapshot):
+
+    paths = {name: globals()[name] for name in ("BASE_DIR", "IMAGE_DIR", "UPSCALED_DIR", "WALLPAPERS_DIR")}
+    try:
+        return wallpaper_refresh.run_sync(config, snapshot, paths, timeout=REFRESH_TIMEOUT)
+    except wallpaper_refresh.RefreshOffline as e:
+        raise Offline(str(e)) from e
 
 
 def apply_sync(state, result, config):
@@ -1478,12 +2086,21 @@ def apply_sync(state, result, config):
     configured = set(config["boards"])
     fully_listed = {listing["url"] for listing in listings if listing["complete"]}
 
-    merged = {
-        key: meta
-        for key, meta in state["pins"].items()
-        if meta.get("board") in configured and meta.get("board") not in fully_listed
-    }
+    listed = {}
+    for listing in listings:
+        for pin in listing["pins"]:
+            listed.setdefault(pin["key"], set()).add(listing["url"])
+
+    merged = {}
+    for key, meta in state["pins"].items():
+        previous = set(meta.get("boards", [meta.get("board")])) & configured
+        memberships = (previous - fully_listed) | listed.get(key, set())
+        if memberships and ((previous - fully_listed) or key in result.get("retained", ())):
+            merged[key] = dict(meta, boards=sorted(memberships))
     merged.update(result["pins"])
+    for key, meta in merged.items():
+        previous = set(state["pins"].get(key, {}).get("boards", [meta.get("board")])) & configured
+        meta["boards"] = sorted((previous - fully_listed) | listed.get(key, set()))
 
     seen = set(state["seen"])
     fresh = [key for key in result["pins"] if key not in seen] if seen else []
@@ -1515,6 +2132,8 @@ def apply_sync(state, result, config):
         if url not in configured:
             del state["board_fails"][url]
 
+    state["disabled_boards"] = [url for url in state["disabled_boards"] if url in configured]
+
     for listing in listings:
         if listing["paged"] and listing["complete"]:
             state["listings"][listing["url"]] = {"stamp": listing["stamp"], "pins": listing["pins"]}
@@ -1528,6 +2147,8 @@ def apply_sync(state, result, config):
     if listings:
         state["last_refresh_ok"] = now
         state["board_names"] = [names[url] for url in config["boards"] if url in names]
+
+    state["refresh_pending"] = bool(result.get("retry") or result["failures"] or result["offline"] or any(not listing["complete"] for listing in listings))
 
     keys = set(merged)
     files = source_files()
@@ -1573,13 +2194,20 @@ def do_refresh(config):
         log("Refreshing from Pinterest...")
 
         try:
-            result = sync_boards(config, snapshot)
+            result = sync_with_deadline(config, snapshot)
 
         except Offline as e:
             # Being offline says nothing about the boards, so retry on the next tick.
             with locked_state() as state:
                 state["last_refresh_attempt"] = previous_attempt
+                state["refresh_pending"] = True
             log(f"Offline ({e}); will retry on the next tick.")
+            return False
+
+        except (wallpaper_refresh.RefreshTimeout, wallpaper_refresh.RefreshWorkerError) as e:
+            with locked_state() as state:
+                state["refresh_pending"] = True
+            log_error(f"Refresh worker failed ({short(e)}); retrying after {config['retry_hours']}h.")
             return False
 
         with locked_state() as state:
@@ -1606,7 +2234,7 @@ def refresh_due(config, state):
     def within(stamp, hours):
         return 0 <= now - stamp < hours * 3600
 
-    if available_pins(state) and within(state["last_refresh_ok"], config["refresh_hours"]):
+    if not state.get("refresh_pending") and available_pins(state) and within(state["last_refresh_ok"], config["refresh_hours"]):
         return False
 
     return not within(state["last_refresh_attempt"], config["retry_hours"])
@@ -1620,8 +2248,12 @@ def available_pins(state, files=None):
 
     files = source_files() if files is None else files
     banned = set(state["banned"])
+    disabled = set(state.get("disabled_boards", ()))
 
-    return [key for key in state["pins"] if key in files and key not in banned]
+    def switched_on(meta):
+        return not disabled or any(board not in disabled for board in meta.get("boards") or [meta.get("board")])
+
+    return [key for key, meta in state["pins"].items() if key in files and key not in banned and switched_on(meta)]
 
 
 def build_deck(pool, favorites, weight, avoid=()):
@@ -1670,7 +2302,7 @@ def draw(state, pool, count, config, prefer_dark):
     pool_set = set(pool)
     deck = [key for key in state["deck"] if key in pool_set]
     favorites = set(state["favorites"]) & pool_set
-    avoid = set(current_pins(state))
+    avoid = {key for key in current_pins(state) if key is not None}
 
     lumas = [state["pins"][key]["luma"] for key in pool if "luma" in state["pins"][key]]
     threshold = statistics.median(lumas) if lumas else None
@@ -1679,19 +2311,23 @@ def draw(state, pool, count, config, prefer_dark):
 
     for _ in range(min(count, len(pool))):
 
-        blocked = avoid | set(picks)
+        # Avoid what's on screen; when the pool is too small for that, at least keep the displays distinct.
+        for blocked in (avoid | set(picks), set(picks)):
 
-        if not deck:
-            deck = build_deck(pool, favorites, config["favorite_weight"], blocked)
+            if not deck:
+                deck = build_deck(pool, favorites, config["favorite_weight"], blocked)
 
-        candidates = [i for i, key in enumerate(deck) if key not in blocked]
-
-        # The deck can hold nothing but what's on screen (a favorite's last copy): start the next pass early.
-        if not candidates and set(pool) - blocked:
-            deck += build_deck(pool, favorites, config["favorite_weight"], blocked)
             candidates = [i for i, key in enumerate(deck) if key not in blocked]
 
-        candidates = candidates or [i for i, key in enumerate(deck) if key not in picks] or [0]
+            # The deck can hold nothing but blocked pins (a favorite's last copy): start the next pass early.
+            if not candidates and pool_set - blocked:
+                deck += build_deck(pool, favorites, config["favorite_weight"], blocked)
+                candidates = [i for i, key in enumerate(deck) if key not in blocked]
+
+            if candidates:
+                break
+
+        candidates = candidates or [0]
         index = candidates[0]
 
         if prefer_dark is not None and threshold is not None:
@@ -1720,10 +2356,59 @@ def push_history(state, pins):
     state["last_change"] = int(time.time())
 
 
-def show(assignment, state):
+def show(assignment, state, pins):
 
-    set_wallpapers(assignment)
+    try:
+        set_wallpapers(assignment)
+    except WallpaperTransactionError as error:
+        reconcile_wallpaper_failure(error, assignment, pins, state)
+        raise
     state["on_screen"] = [os.path.basename(path) for _, path in assignment]
+    state["current"] = [pins[index % len(pins)] for index in range(len(assignment))]
+    state["current_screens"] = [screen.get("id") for screen, _ in assignment]
+
+
+def reconcile_wallpaper_failure(error, assignment, pins, state):
+
+    previous_current = current_pins(state)
+    previous_paths = list(state["on_screen"])
+    previous_screens = list(state.get("current_screens", []))
+    by_screen = {str(screen.get("id")): (index, path) for index, (screen, path) in enumerate(assignment)}
+    wildcard = next(((index, path) for index, (screen, path) in enumerate(assignment) if screen.get("id") is None), None)
+    slot_count = max(len(previous_current), len(previous_paths), len(previous_screens), len(assignment),
+                     len(error.screens) if wildcard else 0)
+    actual_current = list(previous_current) + [None] * (slot_count - len(previous_current))
+    actual_paths = list(previous_paths) + [""] * (slot_count - len(previous_paths))
+    actual_screens = list(previous_screens) + [None] * (slot_count - len(previous_screens))
+    for result_position, result in enumerate(error.screens):
+        if not isinstance(result, dict):
+            continue
+        screen_id = str(result.get("id"))
+        match = by_screen.get(screen_id)
+        wildcard_slot = match is None and wildcard is not None
+        if wildcard_slot:
+            match = (result_position, wildcard[1])
+        if match is None:
+            continue
+        index, target_path = match
+        path = result.get("path") if isinstance(result.get("path"), str) else ""
+        assignment_index = wildcard[0] if wildcard_slot else index
+        wanted = pins[assignment_index % len(pins)] if pins else None
+        if path == target_path:
+            actual_current[index] = wanted
+        else:
+            old_index = next((position for position, old_id in enumerate(previous_screens)
+                              if str(old_id) == screen_id), None)
+            if old_index is None and wildcard_slot:
+                old_index = result_position if result_position < len(previous_current) else (0 if len(previous_current) == 1 else None)
+            old_path = previous_paths[old_index] if old_index is not None and old_index < len(previous_paths) else None
+            old_key = previous_current[old_index] if old_index is not None and old_index < len(previous_current) else None
+            actual_current[index] = old_key if old_path and os.path.basename(path) == old_path else None
+        actual_paths[index] = os.path.basename(path) if path else ""
+        actual_screens[index] = result.get("id")
+    state["current"] = actual_current
+    state["current_screens"] = actual_screens
+    state["on_screen"] = actual_paths
 
 
 def advance(config, state):
@@ -1739,6 +2424,8 @@ def advance(config, state):
     count = len(screens) if config["different_per_display"] else 1
     prefer_dark = mood_preference(config)
 
+    original_deck = list(state["deck"])
+    bad_keys = set()
     while pool:
 
         picks = draw(state, pool, count, config, prefer_dark)
@@ -1750,23 +2437,30 @@ def advance(config, state):
         except BadSource as e:
             log_error(f"Pin {e.key}: cached image is unreadable ({e}); it will be re-downloaded on the next refresh.")
             forget_source(e.key, files)
+            bad_keys.add(e.key)
             pool = [key for key in pool if key != e.key]
             state["deck"] = [key for key in picks if key != e.key] + state["deck"]
 
         except Exception as e:
-            state["deck"] = picks + state["deck"]
+            state["deck"] = [key for key in original_deck if key not in bad_keys]
             log_error(f"Couldn't render the wallpaper ({short(e)}).")
             return False
 
     else:
+        state["deck"] = [key for key in original_deck if key not in bad_keys]
         log_error("No readable wallpapers left; run ./pw refresh.")
         return False
 
     try:
-        show(assignment, state)
+        show(assignment, state, picks)
+
+    except WallpaperTransactionError as e:
+        state["deck"] = [key for key in original_deck if key not in bad_keys]
+        log_error(f"Wallpaper transaction incomplete ({short(e)}); reconciled actual display state.")
+        return False
 
     except Exception as e:
-        state["deck"] = picks + state["deck"]
+        state["deck"] = [key for key in original_deck if key not in bad_keys]
         log_error(f"Failed to set wallpaper ({short(e)}).")
         return False
 
@@ -1800,7 +2494,7 @@ def go_back(config, state):
 
     # Nothing in state changes until the desktop has actually changed.
     try:
-        show(render_for_screens(target, current_screens(config, state), config, state, files), state)
+        show(render_for_screens(target, current_screens(config, state), config, state, files), state, target)
 
     except Exception as e:
         log_error(f"Failed to go back ({short(e)}).")
@@ -1820,9 +2514,17 @@ def go_back(config, state):
 def reapply_current(config, state):
 
     pins = current_pins(state)
+    if any(pin is None for pin in pins):
+        raise WallpaperTransactionError(["cannot reapply while a display identity is unknown"], [])
     files = source_files()
+    screens = current_screens(config, state)
 
-    show(render_for_screens(pins, current_screens(config, state), config, state, files), state)
+    # macOS can list displays in a different order after one is reconnected, so pins follow display IDs.
+    saved = state["current_screens"]
+    by_display = {str(display): pin for display, pin in zip(saved, pins)} if len(saved) == len(pins) else {}
+    pins = [by_display.get(str(screen.get("id")), pins[index % len(pins)]) for index, screen in enumerate(screens)]
+
+    show(render_for_screens(pins, screens, config, state, files), state, pins)
 
 
 def tick_skip_reason(config, state):
@@ -1874,7 +2576,12 @@ def parse_duration(text):
     if not match:
         raise ValueError(f"can't read duration {text!r}; use e.g. 30m, 2h or 1d")
 
-    return float(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    duration = float(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    if not math.isfinite(duration):
+        raise ValueError("duration is too large")
+    if duration <= 0:
+        raise ValueError("duration must be greater than zero")
+    return duration
 
 
 def cmd_tick(config, args):
@@ -1883,11 +2590,20 @@ def cmd_tick(config, args):
         do_refresh(config)
 
     with locked_state() as state:
-        ok = True if tick_skip_reason(config, state) else advance(config, state)
+        skip = tick_skip_reason(config, state)
+        ok = True if skip else advance(config, state)
         snapshot = copy.deepcopy(state)
 
     # After the change and a few pins at a time, so slow AI upscaling never delays the wallpaper.
     upscale_sources(config, snapshot, source_files(), UPSCALES_PER_TICK)
+
+    if not skip and ok and config.get("orientation_model") and time.time() >= snapshot.get("orientation_retry_after", 0):
+        try:
+            orient_batch(config, snapshot)
+        except ValueError as error:
+            with locked_state() as state:
+                state["orientation_retry_after"] = time.time() + 3600
+            log_error(f"Orientation unavailable; retrying after one hour ({short(error)}).")
 
     return 0 if ok else 1
 
@@ -1907,8 +2623,14 @@ def cmd_prev(config, args):
 def cmd_shuffle(config, args):
 
     with locked_state() as state:
+        original_deck = list(state["deck"])
+        original_files = set(source_files())
         state["deck"] = []
-        return 0 if advance(config, state) else 1
+        if advance(config, state):
+            return 0
+        removed = original_files - set(source_files())
+        state["deck"] = [key for key in original_deck if key not in removed]
+        return 1
 
 
 def cmd_refresh(config, args):
@@ -1918,11 +2640,26 @@ def cmd_refresh(config, args):
 
 def cmd_ban(config, args):
 
-    display = parse_display(args)
+    expected = None
+    display_args = args
+    if "--expected-pin" in args:
+        if len(args) != 3 or args[1] != "--expected-pin" or not re.fullmatch(PIN_ID, args[2]):
+            raise ValueError("expected a display followed by --expected-pin and a valid pin ID")
+        display_args = args[:1]
+        expected = args[2]
+    display = parse_display(display_args)
 
     with locked_state() as state:
 
-        key = pin_on_display(state, display)
+        try:
+            key = pin_on_display(state, display)
+        except ValueError as error:
+            if expected is not None:
+                raise StaleBan("display changed since confirmation; ban cancelled") from error
+            raise
+
+        if expected is not None and key != expected:
+            raise StaleBan("display pin changed since confirmation; ban cancelled")
 
         if not key:
             log("Nothing is showing yet, so there is nothing to ban.")
@@ -1932,13 +2669,15 @@ def cmd_ban(config, args):
             state["banned"].append(key)
 
         state["deck"] = [k for k in state["deck"] if k != key]
-        state["history"] = [
-            entry for entry in ([k for k in entry if k != key] for entry in state["history"]) if entry
-        ]
 
         log(f"Banned pin {key}.")
 
-        return 0 if advance(config, state) else 1
+        if not advance(config, state):
+            return 1
+        state["history"] = [
+            entry for entry in state["history"] if key not in entry
+        ]
+        return 0
 
 
 def cmd_bans(config, args):
@@ -2007,13 +2746,13 @@ def cmd_fav(config, args):
 
 def cmd_rotate(config, args):
 
-    words = [a.lower() for a in args if a.lower() in (*ROTATE_STEPS, "reset")]
+    words = [a.lower() for a in args if a.lower() in (*ROTATE_STEPS, "reset", "auto")]
 
     if len(words) > 1:
-        raise ValueError("give one direction: cw, ccw, 180 or reset")
+        raise ValueError("give one direction: cw, ccw, 180, reset or auto")
 
     direction = words[0] if words else "cw"
-    display = parse_display(args, allowed=(*ROTATE_STEPS, "reset"))
+    display = parse_display(args, allowed=(*ROTATE_STEPS, "reset", "auto"))
 
     with locked_state() as state:
 
@@ -2023,9 +2762,12 @@ def cmd_rotate(config, args):
             log("Nothing is showing yet.")
             return 1
 
-        angle = 0 if direction == "reset" else (state["rotations"].get(key, 0) + ROTATE_STEPS[direction]) % 360
+        angle = (effective_angle(key, config, state) + ROTATE_STEPS[direction]) % 360 if direction in ROTATE_STEPS else 0
 
-        if angle:
+        if direction == "auto":
+            state["rotations"].pop(key, None)
+            angle = effective_angle(key, config, state)
+        elif angle or config.get("orientation_model"):
             state["rotations"][key] = angle
         else:
             state["rotations"].pop(key, None)
@@ -2061,7 +2803,12 @@ def cmd_pause(config, args):
     if len(args) > 1:
         raise ValueError("usage: pw pause [30m|2h|1d]")
 
-    until = -1 if not args else int(time.time() + parse_duration(args[0]))
+    if not args:
+        until = -1
+    else:
+        until = int(time.time() + parse_duration(args[0]))
+        if not _valid_timestamp(until):
+            raise ValueError("pause duration exceeds the supported calendar range")
 
     with locked_state() as state:
         state["paused_until"] = until
@@ -2089,7 +2836,10 @@ def pause_label(state):
     if state["paused_until"] == -1:
         return "paused until resumed"
 
-    until = time.localtime(state["paused_until"])
+    try:
+        until = time.localtime(state["paused_until"])
+    except (OverflowError, OSError, TypeError, ValueError):
+        return "paused until an unknown date"
     same_day = until[:3] == time.localtime()[:3]
 
     return f"paused until {time.strftime('%H:%M' if same_day else '%a %d %b %H:%M', until)}"
@@ -2097,10 +2847,14 @@ def pause_label(state):
 
 def agent_summary(config):
 
-    interval = launchctl_interval(LABEL)
+    try:
+        interval = launchctl_interval(LABEL)
+        legacy_interval = launchctl_interval(LEGACY_LABEL)
+    except RuntimeError as error:
+        return f"status unavailable ({short(error)})"
     wanted = round(config["interval_minutes"] * 60)
 
-    if launchctl_interval(LEGACY_LABEL) is not None:
+    if legacy_interval is not None:
         return "old com.pinterest.wallpaper agent is running; run ./pw install to migrate"
 
     if interval is None:
@@ -2118,21 +2872,31 @@ def agent_summary(config):
 def source_note(key, state, config, size):
 
     meta = dict(state["pins"].get(key, {}))
-    ai = bool(config["upscaler"]) and os.path.exists(os.path.join(UPSCALED_DIR, key + ".jpg"))
+    ai = False
+    files = source_files()
+    if config["upscaler"] and key in files:
+        try:
+            cached = upscale_cache_paths(key, config["upscaler"], config["upscaler_model"],
+                                         os.path.join(IMAGE_DIR, files[key]))[0]
+            ai = os.path.exists(cached)
+        except OSError:
+            ai = False
 
     if ai:
         meta.update(width=meta.get("width", 0) * 4, height=meta.get("height", 0) * 4)
 
-    w, h = oriented_size(meta, state["rotations"].get(key, 0))
+    angle = effective_angle(key, config, state, files)
+    w, h = oriented_size(meta, angle)
 
     if not w or not h:
         return ""
 
     source = f"{w}x{h} {'AI-upscaled ' if ai else ''}source"
-    cover = enlargement(meta, state["rotations"].get(key, 0), size)
-    limit = config["max_upscale"] or float("inf")
+    cover = enlargement(meta, angle, size)
+    settings = render_settings(key, config, state, ai, files)
+    limit = settings["max_upscale"] or float("inf")
 
-    if config["fit_mode"] == "cover" and cover <= limit:
+    if settings["fit"] == "cover" and cover <= limit:
         return f"{source}, scaled {cover:.1f}x to fill {size[0]}x{size[1]}"
 
     return f"{source}, scaled {min(size[0] / w, size[1] / h, limit):.1f}x on a backdrop"
@@ -2151,7 +2915,7 @@ def cmd_status(config, args):
     print(f"Boards        : {', '.join(state['board_names']) or '(not synced yet)'}")
 
     for board in config["boards"]:
-        print(f"                {board}")
+        print(f"                {board}{'  (switched off)' if board in state['disabled_boards'] else ''}")
 
     for i, screen in enumerate(screens, 1):
         label = "Displays      :" if i == 1 else "               "
@@ -2159,10 +2923,16 @@ def cmd_status(config, args):
 
     for i, key in enumerate(showing, 1):
 
+        if key is None:
+            label = "Showing       :" if i == 1 else "               "
+            print(f"{label} unknown display state")
+            continue
+
         notes = []
 
-        if state["rotations"].get(key):
-            notes.append(f"rotated {state['rotations'][key]}")
+        angle = effective_angle(key, config, state, files)
+        if angle:
+            notes.append(f"rotated {angle}")
         if key in state["favorites"]:
             notes.append("favorite")
 
@@ -2203,7 +2973,9 @@ def cmd_status(config, args):
 
     due_in = state["last_refresh_ok"] + config["refresh_hours"] * 3600 - time.time()
 
-    if due_in <= 0:
+    if not math.isfinite(due_in):
+        print("Next refresh  : time outside supported range")
+    elif due_in <= 0:
         print("Next refresh  : due now")
     else:
         print(f"Next refresh  : in {int(due_in) // 3600}h {int(due_in) % 3600 // 60}m")
@@ -2244,7 +3016,7 @@ def cmd_menubar(config, args):
     print(f"PW{' (paused)' if paused else ''} | sfimage=photo.on.rectangle.angled")
     print("---")
 
-    if showing:
+    if showing and showing[0] is not None:
         url = pin_url(showing[0])
         print(f"Pin {menu_text(showing[0])}" + (f" | href={url}" if url else ""))
         if note(showing[0], 1):
@@ -2259,16 +3031,19 @@ def cmd_menubar(config, args):
     item("Previous wallpaper", "prev")
     item("Shuffle", "shuffle")
 
-    if showing:
+    if showing and showing[0] is not None:
         print("---")
         pin_actions(showing[0])
 
-        if len(showing) > 1:
-            for number, key in enumerate(showing[1:], 2):
-                print(f"Display {number}: pin {menu_text(key)}")
-                if note(key, number):
-                    print(f"--{menu_text(note(key, number))}")
-                pin_actions(key, prefix="--", display=(str(number),))
+    if len(showing) > 1:
+        for number, key in enumerate(showing[1:], 2):
+            if key is None:
+                print(f"Display {number}: current wallpaper unknown")
+                continue
+            print(f"Display {number}: pin {menu_text(key)}")
+            if note(key, number):
+                print(f"--{menu_text(note(key, number))}")
+            pin_actions(key, prefix="--", display=(str(number),))
 
     print("---")
 
@@ -2297,30 +3072,43 @@ def bootout(label):
     if launchctl_interval(label) is None:
         return False
 
-    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, check=False)
+    try:
+        result = subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, check=False, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"launchctl bootout failed for {label}: {short(e)}") from e
+    if result.returncode:
+        raise RuntimeError(f"launchctl bootout failed for {label} (exit {result.returncode})")
 
     for _ in range(20):
         if launchctl_interval(label) is None:
-            break
+            return True
         time.sleep(0.25)
 
-    return True
+    raise RuntimeError(f"launchctl job {label} did not stop")
 
 
 def cmd_install(config, args):
 
+    interval = launch_interval_seconds(config.get("interval_minutes"))
+    if interval is None:
+        log_error("interval_minutes cannot be represented as a valid launchd interval.")
+        return 1
+
     os.makedirs(LAUNCH_AGENTS, exist_ok=True)
 
-    if bootout(LEGACY_LABEL):
-        log(f"Stopped the old {LEGACY_LABEL} agent.")
-
+    try:
+        if bootout(LEGACY_LABEL):
+            log(f"Stopped the old {LEGACY_LABEL} agent.")
+        bootout(LABEL)
+    except RuntimeError as e:
+        log_error(str(e))
+        return 1
     remove_quietly(plist_path(LEGACY_LABEL))
-    bootout(LABEL)
 
     agent = {
         "Label": LABEL,
         "ProgramArguments": [PW, "tick"],
-        "StartInterval": round(config["interval_minutes"] * 60),
+        "StartInterval": interval,
         "RunAtLoad": True,
         "StandardOutPath": os.path.join(BASE_DIR, "agent.log"),
         "StandardErrorPath": os.path.join(BASE_DIR, "agent.err"),
@@ -2361,7 +3149,11 @@ def cmd_uninstall(config, args):
 
     for label in (LABEL, LEGACY_LABEL):
 
-        removed = bootout(label) or removed
+        try:
+            removed = bootout(label) or removed
+        except RuntimeError as e:
+            log_error(str(e))
+            return 1
 
         if os.path.lexists(plist_path(label)):
             remove_quietly(plist_path(label))
@@ -2460,6 +3252,24 @@ def cmd_doctor(config, args):
     )
 
     pool = available_pins(state)
+    files = source_files()
+    downloaded = [key for key in state["pins"] if key in files]
+    banned = [key for key in downloaded if key in state["banned"]]
+    switched_off = len(downloaded) - len(banned) - len(pool)
+    left_out = ", ".join(reason for reason in (
+        f"{switched_off} on boards that are switched off (./pw tui, then b, to switch one on)" if switched_off else "",
+        f"{len(banned)} banned (./pw unban <pin-id>|all)" if banned else "",
+    ) if reason)
+
+    if not downloaded:
+        hint = ("; skip_upscale_over may be leaving every pin out" if config["skip_upscale_over"] and state["last_refresh_ok"]
+                else "; run ./pw refresh")
+        report("warn", f"Nothing to rotate: no pins are downloaded{hint}")
+    elif not pool:
+        report("warn", f"Nothing to rotate: {len(downloaded)} pin(s) are downloaded but none are eligible: {left_out}")
+    elif left_out:
+        report("ok", f"Left out of rotation: {left_out}")
+
     target = largest_screen(config, state)
     blurry = [
         key for key in pool
@@ -2480,6 +3290,54 @@ def cmd_doctor(config, args):
     return 1 if failures else 0
 
 
+def cmd_orient(config, args):
+    if not args or args[0] not in ("preview", "scan") or len(args) > (2 if args[0] == "preview" else 1):
+        raise ValueError("usage: orient preview [PIN_ID] | orient scan")
+    if args[0] == "scan":
+        count = orient_batch(config, load_state(), explicit=True)
+        print(f"Orientation scan: cached {count} pin(s); at most 4 per invocation.")
+        return 0
+
+    backend, model, _ = orientation_backend(config)
+    if len(args) == 2:
+        key = args[1]
+    else:
+        try:
+            with open(STATE_FILE) as handle:
+                raw = json.load(handle)
+            current = raw.get("current", [])
+            history = raw.get("history", [])
+            if not current and isinstance(history, list) and history and isinstance(history[-1], list):
+                current = history[-1]
+            key = current[0] if isinstance(current, list) and current else None
+        except (OSError, ValueError, AttributeError) as error:
+            raise ValueError(f"cannot read current pin: {short(error)}") from error
+    if not isinstance(key, str) or not re.fullmatch(PIN_ID, key):
+        raise ValueError("no current pin; provide a pin ID")
+    try:
+        files = source_files()
+    except OSError as error:
+        raise ValueError(f"cannot read local sources: {short(error)}") from error
+    if key not in files:
+        raise ValueError(f"no local source for pin {key}")
+    try:
+        predictions = backend.predict(model, [os.path.join(IMAGE_DIR, files[key])], timeout=ORIENTATION_TIMEOUT)
+    except (backend.OrientationError, OSError) as error:
+        raise ValueError(f"orientation failed: {short(error)}") from error
+    if len(predictions) != 1 or predictions[0] is None:
+        raise ValueError(f"orientation could not read pin {key}")
+    prediction = predictions[0]
+    print(f"Pin {key}: {'abstain' if prediction.angle is None else str(prediction.angle) + ' degrees clockwise'} (score {prediction.score:.3f})")
+    return 0
+
+
+def cmd_tui(config, args):
+    import wallpaper_tui
+    from wallpaper_tui_backend import Backend
+
+    return wallpaper_tui.run(Backend(sys.modules[__name__], config))
+
+
 COMMANDS = {
     "tick": cmd_tick,
     "next": cmd_next,
@@ -2490,6 +3348,7 @@ COMMANDS = {
     "ban": cmd_ban,
     "fav": cmd_fav,
     "rotate": cmd_rotate,
+    "orient": cmd_orient,
     "open": cmd_open,
     "refresh": cmd_refresh,
     "bans": cmd_bans,
@@ -2499,6 +3358,7 @@ COMMANDS = {
     "uninstall": cmd_uninstall,
     "doctor": cmd_doctor,
     "menubar": cmd_menubar,
+    "tui": cmd_tui,
 }
 
 USAGE = """usage: pw <command> [arguments]
@@ -2513,15 +3373,18 @@ rotation
 the pin on screen (add a display number, e.g. "ban 2", with different_per_display)
   ban [display]                 drop it from rotation, then advance
   fav [display]                 toggle favorite; favorites come up more often
-  rotate [cw|ccw|180|reset] [display]
+  rotate [cw|ccw|180|reset|auto] [display]
                                 turn it, e.g. so a vertical pin fills a landscape screen
   open [display]                open it on pinterest.com
 
 library
+  tui                           browse and preview wallpapers interactively
   refresh                       re-read the boards from Pinterest now
   bans                          list banned pins
   unban <pin-id>|all            put banned pins back into rotation
   status                        show what the tool is doing
+  orient preview [PIN_ID]       predict locally without changing state or wallpaper
+  orient scan                   cache up to 4 uncached pins per invocation
 
 setup
   install                       install or update the launchd agent (uses interval_minutes)
@@ -2536,7 +3399,7 @@ def main(argv):
 
     command, args = (argv[0], argv[1:]) if argv else ("", [])
 
-    if command in ("-h", "--help", "help"):
+    if command in ("-h", "--help", "help") or any(arg in ("-h", "--help") for arg in args):
         print(USAGE)
         return 0
 
@@ -2546,10 +3409,20 @@ def main(argv):
         print(USAGE if not command else f"unknown command: {command}\n\n{USAGE}", file=sys.stderr)
         return 2
 
-    for directory in (IMAGE_DIR, UPSCALED_DIR, WALLPAPERS_DIR):
-        os.makedirs(directory, exist_ok=True)
+    if args and command in {"tick", "next", "prev", "shuffle", "resume", "refresh", "bans", "status", "install", "uninstall", "doctor", "menubar", "tui"}:
+        print(f"pw {command}: unexpected argument {args[0]!r}", file=sys.stderr)
+        return 2
 
-    config, problems = load_config()
+    if command == "tui" and (not sys.stdin.isatty() or not sys.stdout.isatty()):
+        print("pw tui: an interactive terminal is required", file=sys.stderr)
+        return 2
+
+    preview = command == "tui" or command == "orient" and args[:1] == ["preview"]
+    if not preview:
+        for directory in (IMAGE_DIR, UPSCALED_DIR, WALLPAPERS_DIR):
+            os.makedirs(directory, exist_ok=True)
+
+    config, problems = load_config(create=not preview)
 
     if command not in ("menubar", "doctor"):
         for problem in problems:

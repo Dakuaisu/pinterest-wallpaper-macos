@@ -230,8 +230,12 @@ class SourceNoteTests(Sandbox):
 
     def test_rotation_and_ai_upscaling_are_reflected(self):
 
-        self.config["upscaler"] = "/bin/true"
-        open(os.path.join(pw.UPSCALED_DIR, "p.jpg"), "wb").close()
+        self.config["upscaler"] = self.make_upscaler()
+        source = os.path.join(pw.IMAGE_DIR, "p.jpg")
+        with open(source, "wb") as handle:
+            handle.write(image_bytes())
+        derivative = pw.upscale_cache_paths("p", self.config["upscaler"], self.config["upscaler_model"], source)[0]
+        open(derivative, "wb").close()
 
         note = pw.source_note("p", self.state_with(400, 300, rotation=90), self.config, TARGET)
 

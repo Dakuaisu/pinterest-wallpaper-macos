@@ -192,6 +192,18 @@ class ScrapeTests(Sandbox):
         self.assertEqual(listing["pins"][0]["url"], "https://i.pinimg.com/originals/ab/cd/abcd.jpg")
         self.assertFalse(listing["complete"])
 
+    def test_rss_accepts_opaque_pin_ids(self):
+
+        item = (
+            "<item><link>https://www.pinterest.com/pin/e1_AfqPShy-RzcM_E7/</link>"
+            "<description>&lt;img src=&quot;https://i.pinimg.com/236x/ab/cd/abcd.jpg&quot;&gt;</description></item>"
+        )
+
+        with mock.patch.object(pw.SESSION, "get", return_value=FakeResponse(f"<rss><channel><title>C</title>{item}</channel></rss>")):
+            listing = pw.scrape_board_rss(BOARD, 250)
+
+        self.assertEqual(listing["pins"][0]["key"], "e1_AfqPShy-RzcM_E7")
+
     def test_network_error_is_offline_and_skips_rss(self):
 
         offline = requests.ConnectionError("dns")
@@ -547,7 +559,8 @@ class RenderTests(Sandbox):
         files = pw.source_files()
         pw.upscale_sources(self.config, state, files, 5)
 
-        with Image.open(os.path.join(pw.UPSCALED_DIR, "low.jpg")) as up:
+        upscaled_path = next(os.path.join(pw.UPSCALED_DIR, name) for name in os.listdir(pw.UPSCALED_DIR) if name.startswith("low.") and name.endswith(".jpg"))
+        with Image.open(upscaled_path) as up:
             self.assertEqual(up.size, (1600, 1200))
 
         src, ai = pw.source_for("low", self.config, files)
@@ -560,7 +573,7 @@ class RenderTests(Sandbox):
         session = mock.Mock(get=lambda url, **kw: FakeResponse(content=body, content_type="image/jpeg"))
 
         with mock.patch.object(pw, "worker_session", return_value=session):
-            filename, meta = pw.download_source({"key": "5", "url": "https://x/5.jpg"})
+            filename, meta = pw.download_source({"key": "5", "url": "https://i.pinimg.com/originals/5.jpg"})
 
         with open(os.path.join(pw.IMAGE_DIR, filename), "rb") as handle:
             self.assertEqual(handle.read(), body)
@@ -614,10 +627,15 @@ class ReviewFixTests(Sandbox):
 
         self.assertIsNone(pw.pin_from_feed(dict(base, id="../../escaped"), BOARD))
         self.assertIsNone(pw.pin_from_feed(dict(base, id="12.5"), BOARD))
+        self.assertIsNone(pw.pin_from_feed(dict(base, id="-rf"), BOARD))
+        self.assertIsNone(pw.pin_from_feed(dict(base, id="a/b"), BOARD))
         self.assertIsNone(pw.pin_from_feed(
             {"type": "pin", "id": "1", "images": {"orig": {"url": "https://evil.example/a.jpg"}}}, BOARD
         ))
         self.assertEqual(pw.pin_from_feed(dict(base, id=123), BOARD)["key"], "123")
+        # Pinterest's newer opaque IDs (seen November 2026).
+        opaque = "e1_AfqPShytRzcM_E74iyTWNnG9C25OldY-VIv_euWXafQAKPVAG_aN"
+        self.assertEqual(pw.pin_from_feed(dict(base, id=opaque), BOARD)["key"], opaque)
 
     def test_menubar_neutralises_hostile_board_names(self):
 

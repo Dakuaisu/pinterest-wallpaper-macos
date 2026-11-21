@@ -22,7 +22,7 @@ SCREEN = {"id": 1, "name": "Built-in", "width": 160, "height": 100}
 
 REAL = {
     name: getattr(pw, name)
-    for name in ("set_wallpapers", "detect_screens", "notify", "screen_locked", "log", "log_error")
+    for name in ("set_wallpapers", "detect_screens", "notify", "screen_locked", "log", "log_error", "sync_with_deadline")
 }
 
 
@@ -71,8 +71,18 @@ class FakeResponse:
         self.text = text
         self.status_code = status
         self._body = body
-        self.content = content
-        self.headers = {"Content-Type": content_type}
+        self.content = content or text.encode()
+        self.headers = {"Content-Type": content_type, "Content-Length": str(len(self.content))}
+        self.url = "https://www.pinterest.com/"
+        self.raw = self
+        self.closed = False
+
+    def iter_content(self, chunk_size=65536):
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset:offset + chunk_size]
+
+    def close(self):
+        self.closed = True
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -163,6 +173,10 @@ class Sandbox(unittest.TestCase):
             patcher = mock.patch.object(pw, name, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+        patcher = mock.patch.object(pw, "sync_with_deadline", side_effect=lambda config, snapshot: pw.sync_boards(config, snapshot))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         self.addCleanup(shutil.rmtree, self.root)
         self.config = copy.deepcopy(pw.DEFAULT_CONFIG)

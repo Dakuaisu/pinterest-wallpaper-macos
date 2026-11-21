@@ -134,13 +134,13 @@ class LibraryCommandTests(Sandbox):
         self.assertEqual((code, out), (0, "No banned pins."))
 
         with pw.locked_state() as state:
-            state["banned"] = ["123", "d41d8cd9"]
+            state["banned"] = ["123", "d41d8cd98f00b204e9800998ecf8427e"]
 
         code, out = self.printed(pw.cmd_bans)
 
         self.assertIn("Banned pins (2):", out)
         self.assertIn("123  https://www.pinterest.com/pin/123/", out)
-        self.assertIn("d41d8cd9  (from an older version", out)
+        self.assertIn("d41d8cd98f00b204e9800998ecf8427e  (from an older version", out)
 
     def test_unban_unknown_pin(self):
 
@@ -161,7 +161,7 @@ class LibraryCommandTests(Sandbox):
         self.assertEqual(pw.cmd_open(self.config, []), 1)
 
         with pw.locked_state() as state:
-            state["history"] = [["d41d8cd9"]]
+            state["history"] = [["d41d8cd98f00b204e9800998ecf8427e"]]
 
         self.assertEqual(pw.cmd_open(self.config, []), 1)
 
@@ -440,6 +440,31 @@ class DoctorTests(Sandbox):
     def doctor(self):
 
         return self.printed(pw.cmd_doctor)
+
+    def test_explains_why_nothing_is_rotating(self):
+
+        self.assertIn("warn  Nothing to rotate: no pins are downloaded; run ./pw refresh", self.doctor()[1])
+
+        with pw.locked_state() as state:
+            state["last_refresh_ok"] = 5
+        self.config["skip_upscale_over"] = 2
+        self.assertIn("no pins are downloaded; skip_upscale_over may be leaving every pin out", self.doctor()[1])
+
+        for key in ("a", "b", "c"):
+            self.add_pin(key)
+        with pw.locked_state() as state:
+            state["banned"] = ["a"]
+            state["disabled_boards"] = [BOARD]
+        out = self.doctor()[1]
+        self.assertIn("warn  Nothing to rotate: 3 pin(s) are downloaded but none are eligible:"
+                      " 2 on boards that are switched off (./pw tui, then b, to switch one on),"
+                      " 1 banned (./pw unban <pin-id>|all)", out)
+
+        with pw.locked_state() as state:
+            state["disabled_boards"] = []
+        out = self.doctor()[1]
+        self.assertIn("ok    Left out of rotation: 1 banned", out)
+        self.assertNotIn("Nothing to rotate", out)
 
     def test_healthy_setup(self):
 
