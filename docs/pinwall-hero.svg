@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 480" width="1280" height="480" role="img" aria-labelledby="title desc">
+  <title id="title">Pinwall</title>
+  <desc id="desc">Original abstract artwork arranged behind a desktop display, against a dark teal background.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#0b171d"/>
+      <stop offset="1" stop-color="#142d32"/>
+    </linearGradient>
+    <radialGradient id="light" cx="72%" cy="34%" r="55%">
+      <stop stop-color="#397c78" stop-opacity=".3"/>
+      <stop offset="1" stop-color="#142d32" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#9bd8ca"/>
+      <stop offset="1" stop-color="#2f706f"/>
+    </linearGradient>
+    <linearGradient id="frame" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#526969"/>
+      <stop offset=".45" stop-color="#1b2d31"/>
+      <stop offset="1" stop-color="#101d21"/>
+    </linearGradient>
+    <linearGradient id="backCard" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#b8d6ca"/>
+      <stop offset="1" stop-color="#4d9185"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#b2ded2" stroke-opacity=".055"/>
+    </pattern>
+    <clipPath id="screenClip"><rect x="723" y="104" width="425" height="237" rx="4"/></clipPath>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+      <feOffset dy="18"/>
+      <feComponentTransfer><feFuncA type="linear" slope=".38"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="480" fill="url(#background)"/>
+  <rect width="1280" height="480" fill="url(#light)"/>
+  <rect width="1280" height="480" fill="url(#grid)"/>
+  <path d="M0 404C232 370 411 472 637 423S1058 353 1280 400V480H0Z" fill="#081419" fill-opacity=".38"/>
+  <path d="M64 73H117" stroke="#8fe0ce" stroke-width="4" stroke-linecap="round"/>
+  <text x="64" y="118" fill="#a8d7ce" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17" font-weight="600" letter-spacing="3">PINTEREST / MACOS</text>
+  <text x="58" y="239" fill="#f5faf7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="100" font-weight="750" letter-spacing="-4">PINWALL</text>
+  <path d="M64 272H491" stroke="#9dc5bd" stroke-opacity=".36"/>
+  <text x="64" y="316" fill="#d0e7df" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="25" font-weight="500">Your boards. On your desktop.</text>
+  <path d="M65 390H136" stroke="#8fe0ce" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="151" cy="390" r="3" fill="#8fe0ce"/>
+  <circle cx="164" cy="390" r="3" fill="#8fe0ce" fill-opacity=".5"/>
+  <circle cx="177" cy="390" r="3" fill="#8fe0ce" fill-opacity=".25"/>
+
+  <g filter="url(#shadow)">
+    <g transform="rotate(-11 727 193)">
+      <rect x="624" y="79" width="202" height="242" rx="8" fill="#d7e9dd"/>
+      <rect x="636" y="91" width="178" height="218" rx="3" fill="url(#backCard)"/>
+      <circle cx="765" cy="137" r="28" fill="#d9edcf" fill-opacity=".85"/>
+      <path d="M636 256L695 174L737 226L762 195L814 259V309H636Z" fill="#427a6f"/>
+      <path d="M636 278L683 220L720 258L754 225L814 284V309H636Z" fill="#285a57"/>
+    </g>
+    <g transform="rotate(8 1048 190)">
+      <rect x="970" y="65" width="180" height="232" rx="8" fill="#b4d1c8"/>
+      <rect x="982" y="77" width="156" height="208" rx="3" fill="#355f5d"/>
+      <path d="M982 247C1021 185 1053 173 1138 118V285H982Z" fill="#72a99b"/>
+      <path d="M982 269C1025 237 1087 219 1138 207V285H982Z" fill="#c5dfcb"/>
+    </g>
+    <path d="M907 354H962L969 391H900Z" fill="url(#frame)"/>
+    <path d="M866 393Q870 385 887 385H981Q998 385 1002 393L1007 400H861Z" fill="#6d8580"/>
+    <rect x="704" y="85" width="463" height="278" rx="12" fill="url(#frame)" stroke="#78918b" stroke-width="2"/>
+    <rect x="715" y="96" width="441" height="253" rx="6" fill="#0a171a"/>
+    <g clip-path="url(#screenClip)">
+      <rect x="723" y="104" width="425" height="237" fill="url(#screen)"/>
+      <circle cx="1031" cy="160" r="42" fill="#d8f0d4"/>
+      <path d="M723 262L829 155L921 246L980 191L1148 316V341H723Z" fill="#4b9187"/>
+      <path d="M723 302L815 222L883 278L955 211L1148 334V341H723Z" fill="#286c68"/>
+      <path d="M723 327C793 292 846 304 914 270C996 229 1050 278 1148 296V341H723Z" fill="#174c4e"/>
+      <path d="M723 328C807 304 856 317 923 289C1005 255 1065 293 1148 306" fill="none" stroke="#a5d8c6" stroke-opacity=".42" stroke-width="2"/>
+      <path d="M723 116H1148" stroke="#e8fff0" stroke-opacity=".35" stroke-width="2"/>
+    </g>
+    <circle cx="935" cy="355" r="2" fill="#a5d9cc"/>
+  </g>
+  <rect x="1" y="1" width="1278" height="478" fill="none" stroke="#a6d3c8" stroke-opacity=".16" stroke-width="2"/>
+</svg>
